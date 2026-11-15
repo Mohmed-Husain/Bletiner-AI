@@ -34,24 +34,29 @@ Complete, implementation-ready specifications are available in the [`docs/`](doc
 
 ---
 
-## Implementation Status (Phases 0–3)
+## Implementation Status (Phases 0–8)
 
-The `feat/phase0-3-sandbox-gateway` branch implements the foundation: project setup, domain + SQLite
-persistence, the hardened Kali sandbox, and the dual-homed fail-closed egress gateway. **The autonomous agent
-loop (Phase 4) is intentionally not built** until the live gateway gate passes.
+All nine phases are implemented on `feat/phase0-3-sandbox-gateway`: setup, domain + SQLite persistence, the
+hardened Kali sandbox, the dual-homed fail-closed egress gateway, the pi-inspired agent runtime + providers +
+4-tier tool gate, the PySide6 UI view-models, findings + dual reporting, crash recovery, and the E2E module.
 
 An independent review (`docs/16`) reconciled version/IP contradictions and flagged requirements that are
-impossible or insecure as written (e.g. non-root ambient capabilities, the mislabelled SNI test). The original
-`verify_gateway_poc.py` printed hard-coded PASS results without executing anything; it has been rewritten into
+impossible or insecure as written (non-root ambient capabilities, the mislabelled SNI test, two prioritization
+formulas). The original `verify_gateway_poc.py` printed hard-coded PASS without executing; it is rewritten into
 a real live gate with no simulation mode.
+
+**The autonomous agent cannot run against a live sandbox until the Gate 3 egress PoC passes on Docker** — this
+is enforced in code (`require_gate3_certified`), not just documented. So the agent is built and unit-tested, but
+its live path is gated off until the gate is certified on a Docker host.
 
 | Tier | What | Status |
 |---|---|---|
 | A — docs consistency | contradictions reconciled | DONE |
-| B — implementation | code + 127 unit tests, ruff + `mypy --strict` clean | PASS |
-| C — empirical security | live Docker egress gate | **PENDING LAB EXECUTION** (no container runtime on the build host) |
+| B — implementation | code + 209 unit tests, ruff + `mypy --strict` clean | PASS |
+| C — empirical / live | live Docker egress gate + E2E | **PENDING LAB EXECUTION** (no container runtime on the build host) |
 
-See [`docs/reports/PHASE_0-3_REPORT.md`](docs/reports/PHASE_0-3_REPORT.md) for the full report.
+See [`docs/reports/PHASE_0-3_REPORT.md`](docs/reports/PHASE_0-3_REPORT.md) and
+[`docs/reports/PHASE_4-8_REPORT.md`](docs/reports/PHASE_4-8_REPORT.md) for the full reports.
 
 ### Developer quickstart
 

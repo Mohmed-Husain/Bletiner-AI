@@ -279,6 +279,22 @@ Host-header inspection on the first request only would let a client send `Host: 
 Restarting the Kali container creates a fresh netns with no default route (fail-closed but broken). The container
 manager uses restart policy `no` and re-injects the route on every (re)start.
 
+### R-30 — Two different prioritization formulas — RESOLVED (DOC-08 §5.1 authoritative)
+ADR-019 specifies a weighted **sum** (`ws·S + wc·C + wv·V − we·E`), while DOC-08 §5.1 specifies a bounded
+**product** (`100·Ws·Wc·Iv·Sr·Cd`). They disagree. DOC-08 §5.1 is implemented
+(`bletiner/reporting/prioritization.py`) because it is the only one with complete factor tables and matches the
+`findings.priority_score` 0–100 column and the no-discard threshold. ADR-019's "weights are configurable, never
+LLM-modified; low scores are never discarded" consequences are preserved. DOC-02 ADR-019 should be updated to
+reference §5.1, or vice versa.
+
+### R-31 — Agent runtime built, but gated — RESOLVED (code-enforced)
+Mandatory instruction #6 and DOC-14 rule 5 forbid running the autonomous agent against a live sandbox before
+Gate 3 passes. Phases 4–8 are implemented as code + deterministic mocked tests (the spec's own Tier B). The
+**live** runtime is gated in code: `bletiner/agent/gate.require_gate3_certified` is called by
+`InvestigationService.start` (and re-asserted in the E2E suite) and raises unless a genuine passing *live* gate
+report exists. A simulated or NOT-RUN report can never certify it (R-05). So the agent code exists and is
+tested, but cannot execute against a live gateway on this host.
+
 ---
 
 ## 5. Requirement → implementation map for Phases 0–3

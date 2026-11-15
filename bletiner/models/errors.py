@@ -111,6 +111,44 @@ class PoCVerificationFailedError(GatewayError):
     pass
 
 
+# --- providers -----------------------------------------------------------------------------------------
+class ProviderError(BletinerError):
+    pass
+
+
+class AuthenticationError(ProviderError):
+    pass
+
+
+class RateLimitExceededError(ProviderError):
+    pass
+
+
+class ContextLengthExceededError(ProviderError):
+    pass
+
+
+class ModelUnavailableError(ProviderError):
+    pass
+
+
+# --- agent harness -------------------------------------------------------------------------------------
+class AgentHarnessError(BletinerError):
+    pass
+
+
+class LoopBudgetExceededError(AgentHarnessError):
+    pass
+
+
+class CheckpointCorruptedError(AgentHarnessError):
+    pass
+
+
+class SteeringValidationError(AgentHarnessError):
+    pass
+
+
 # --- policy --------------------------------------------------------------------------------------------
 class PolicyViolationError(BletinerError):
     pass

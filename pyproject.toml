@@ -14,13 +14,13 @@ dependencies = [
     "docker>=7.1,<8",
     "aiosqlite>=0.20",
     "dnslib==0.9.24",
+    "jinja2>=3.1,<4",
 ]
 
 [project.optional-dependencies]
 # Phase 5+ only. Kept optional so Phases 0-3 do not pull a ~500 MB Qt toolchain.
 ui = ["pyside6>=6.7", "qasync>=0.27"]
 secrets = ["keyring>=25"]
-reporting = ["jinja2>=3.1"]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
@@ -43,7 +43,8 @@ extend-exclude = [".venv", "evidence", "docs", "*.md"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PL"]
 ignore = [
-    "PLR0913",  # many-argument constructors for Docker configs are explicit by design
+    "PLR0913",  # many-argument constructors (Docker configs, DI) are explicit by design
+    "PLR0917",  # same: dependency-injection constructors take several positionals
     "PLR2004",  # magic numbers are protocol constants (TLS/DNS) in parsers
     "PLR0911",
     "PLR0912",
@@ -51,7 +52,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S104", "S108", "PLC0415", "E501", "F841", "RUF043"]
+"tests/**" = ["S101", "S104", "S105", "S108", "PLC0415", "E501", "F841", "RUF043"]
 # The PoC harness provisions a throwaway lab and drives it live; it deliberately uses argv subprocesses,
 # local imports (to stay import-safe when Docker is absent), broad excepts, and lab temp paths.
 "scripts/**" = ["S603", "S607", "S604", "T201", "PLC0415", "S108", "SIM105", "PLR0917", "F841", "S112", "E501", "BLE001"]
@@ -61,6 +62,7 @@ ignore = [
 "bletiner/container/security.py" = ["S108"]
 "bletiner/storage/artifacts.py" = ["S103"]
 "bletiner/container/manager.py" = ["PLC0415"]
+"bletiner/ui/app.py" = ["PLC0415"]
 "bletiner/network/proxy.py" = ["S104"]
 "bletiner/network/dns_filter.py" = ["S104"]
 
@@ -71,7 +73,7 @@ warn_unreachable = true
 packages = ["bletiner"]
 
 [[tool.mypy.overrides]]
-module = ["docker", "docker.*", "dnslib", "dnslib.*"]
+module = ["docker", "docker.*", "dnslib", "dnslib.*", "keyring", "keyring.*", "PySide6", "PySide6.*", "qasync"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
