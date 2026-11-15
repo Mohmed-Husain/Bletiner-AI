@@ -92,10 +92,17 @@ class Lab:
             self.build_images()
         ipam = docker.types.IPAMConfig
         pool = docker.types.IPAMPool
+        # docs/16 R-32: the Kali network is a normal bridge, NOT internal:true. On Docker, an internal
+        # network drops a container's forwarded (off-subnet-destination) frames at the host bridge before
+        # they reach the gateway, so transparent L3 routing through the gateway is impossible under
+        # internal:true. Fail-closed is instead enforced by (a) Kali's sole default route = the gateway
+        # (injected; Docker's default via .1 is replaced), (b) Kali has zero NET_ADMIN/NET_RAW so it cannot
+        # add routes or craft packets to use the host bridge .1 as an escape, and (c) the gateway's default
+        # FORWARD DROP. The upstream lab network stays internal:true, so the lab has no public route at all.
         internal = self.client.networks.create(
             f"bletiner-internal-{SID}",
             driver="bridge",
-            internal=True,
+            internal=False,
             ipam=ipam(pool_configs=[pool(subnet=INTERNAL_SUBNET, gateway="172.30.0.1")]),
             options={"com.docker.network.bridge.enable_icc": "true"},
             labels={"com.bletiner.managed": "true"},
@@ -143,6 +150,12 @@ class Lab:
         )
         self._created.append(gateway)
         self._put_file(gateway, "/etc/bletiner/scope-manifest.json", json.dumps(gw_manifest).encode())
+        # Pin the gateway's internal address to GATEWAY_IP (.254) BEFORE start, so the entrypoint's iptables
+        # and the ready sentinel come up on the address Kali's injected default route points at. Docker
+        # otherwise auto-assigns the first free address (.2), which would leave .254 dark and break egress.
+        net_int = self.client.networks.get(internal.id)
+        net_int.disconnect(gateway.id)
+        net_int.connect(gateway.id, ipv4_address=GATEWAY_IP)
         gateway.start()
         self.client.networks.get(upstream.id).connect(gateway.id, ipv4_address="198.51.100.2")
         # The gateway needs a default route to the canary so leaks are observable.
@@ -167,6 +180,9 @@ class Lab:
             command=["tail", "-f", "/dev/null"],
         )
         self._created.append(kali)
+        # Pin Kali to KALI_IP (.2) so its address matches the topology/policy and audit evidence.
+        net_int.disconnect(kali.id)
+        net_int.connect(kali.id, ipv4_address=KALI_IP)
         kali.start()
         # ADR-016 host-side route injection; Kali never holds NET_ADMIN.
         self.client.containers.run(

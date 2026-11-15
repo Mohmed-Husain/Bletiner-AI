@@ -66,7 +66,12 @@ def build_topology(
     labels = {"com.bletiner.managed": "true", "com.bletiner.session": session_id}
     internal = NetworkSpec(
         name=f"bletiner-internal-{session_id}",
-        internal=True,
+        # docs/16 R-32: NOT internal:true. Docker's internal-network enforcement drops a container's
+        # forwarded (off-subnet-destination) frames at the host bridge before they reach the gateway, which
+        # makes transparent L3 routing through the gateway impossible (proven live by Gate 3). Fail-closed is
+        # enforced instead by: Kali's sole default route = the gateway, Kali's zero NET_ADMIN/NET_RAW (cannot
+        # add routes or craft packets to use the bridge .1 as an escape), and the gateway's FORWARD DROP.
+        internal=False,
         subnet=str(subnet_plan.subnet),
         gateway=str(subnet_plan.bridge_ip),
         enable_icc=True,  # R-10: icc=false would also drop Kali -> gateway

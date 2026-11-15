@@ -2,7 +2,9 @@
 # forwards to an off-lab destination lands on this container and is captured. A passing negative test needs
 # BOTH a client-side failure AND zero captured packets for that destination.
 FROM alpine:3.19
-RUN apk add --no-cache tcpdump python3
+RUN apk add --no-cache tcpdump python3 && mkdir -p /captures
 # A sink that accepts any TCP connection, so a "leak" completes a handshake and is unmistakable in the pcap.
+# The sink runs in the foreground (keeps the container alive); tcpdump runs in the background and its failure
+# must never stop the container, so the pcap is best-effort while the connection log is authoritative.
 COPY docker/lab/canary_sink.py /canary_sink.py
-CMD ["sh", "-c", "python3 /canary_sink.py & tcpdump -nni any -w /captures/leak.pcap 2>/dev/null"]
+CMD ["sh", "-c", "tcpdump -nni any -w /captures/leak.pcap 2>/dev/null & python3 /canary_sink.py"]

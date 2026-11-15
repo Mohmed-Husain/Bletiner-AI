@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
+
 from bletiner.agent.events import AgentEvent, AgentState, EventType
 from bletiner.models.entities import Confidence, Finding, Severity, VerificationStatus, new_id
 from bletiner.ui.app import qt_available
@@ -95,3 +97,25 @@ def test_status_label() -> None:
 
 def test_qt_available_is_bool() -> None:
     assert isinstance(qt_available(), bool)
+
+
+@pytest.mark.skipif(not qt_available(), reason="PySide6 (ui extra) not installed")
+def test_main_window_builds_headless() -> None:
+    """Build the full DOC-05 window offscreen; proves the Qt widget tree constructs without a display."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    from bletiner.ui import theme
+    from bletiner.ui.desktop import build_main_window
+
+    app = QApplication.instance() or QApplication([])
+    theme.apply_dark_theme(app)
+    window = build_main_window()
+    window.resize(1360, 860)
+    # Seeded demo feed + badges rendered; terminal bridge token present.
+    assert window.investigation.feed_list.count() > 0
+    assert window.terminal.bridge_token
+    pixmap = window.grab()
+    assert pixmap.width() == 1360 and pixmap.height() == 860

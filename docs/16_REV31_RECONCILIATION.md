@@ -287,6 +287,29 @@ ADR-019 specifies a weighted **sum** (`ws·S + wc·C + wv·V − we·E`), while 
 LLM-modified; low scores are never discarded" consequences are preserved. DOC-02 ADR-019 should be updated to
 reference §5.1, or vice versa.
 
+### R-32 — `internal: true` breaks gateway-forwarded egress on Docker — RESOLVED (live finding)
+Proven by the live Gate 3 run: with Kali on an `internal: true` network, Docker's internal-network
+enforcement drops Kali's *forwarded* frames (those whose destination IP is off the internal subnet) at the
+host bridge, before they ever reach the gateway container. DNS worked only because its destination is the
+gateway's own on-subnet IP; every off-subnet TCP SYN vanished (gateway `BLETINER_WEB`, `FORWARD`, and
+conntrack counters stayed at 0 while Kali's route table pointed at the gateway). So the spec's
+`internal: true` + transparent-L3-forwarding design is **mutually incompatible on Docker** — exactly the
+"documentation says fail-closed; prove it" gap the gate exists to catch.
+Resolution: the Kali network is a normal bridge (`internal=False`), and fail-closed is enforced by (a) Kali's
+sole default route is the gateway (injected; Docker's default via `.1` is replaced), (b) Kali has zero
+`NET_ADMIN`/`NET_RAW`, so it cannot add a route or craft a packet to use the bridge `.1` as an escape, and
+(c) the gateway's default `FORWARD DROP`. The upstream lab network stays `internal: true`, so the lab has no
+public route at all. `TC-EGRESS-08` (stop gateway → 100% loss) still passes, confirming fail-closed holds.
+Implemented in `bletiner/network/topology.py` and `scripts/poc_lab.py`.
+
+### R-09 addendum — nmap's file capabilities must be stripped — RESOLVED (live finding)
+Also proven live: Kali's `nmap` ships with a file capability (`setcap cap_net_raw` on `/usr/lib/nmap/nmap`).
+Under `no-new-privileges`, the kernel refuses to `exec` a capability-bearing file for an unprivileged user
+(`EPERM`), so nmap would not even start — independent of scan type. Stripping setuid/setgid *mode bits* does
+not remove *file capabilities* (they live in xattrs). The Kali image now clears all file capabilities
+(`setcap -r`), consistent with the accepted zero-capability model (nmap uses `-sT`, which needs none).
+`TC-CAP-01` verifies the process has zero capabilities yet `nmap -sT` exits 0.
+
 ### R-31 — Agent runtime built, but gated — RESOLVED (code-enforced)
 Mandatory instruction #6 and DOC-14 rule 5 forbid running the autonomous agent against a live sandbox before
 Gate 3 passes. Phases 4–8 are implemented as code + deterministic mocked tests (the spec's own Tier B). The

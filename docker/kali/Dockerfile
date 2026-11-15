@@ -30,6 +30,12 @@ RUN groupadd -g 1000 bletiner && \
 # and removing them closes the local-privesc vector (DOCK-002).
 RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} + 2>/dev/null || true
 
+# Strip FILE CAPABILITIES from all binaries (docs/16 R-09). Kali's nmap ships with setcap cap_net_raw on
+# /usr/lib/nmap/nmap; under no-new-privileges the kernel refuses to exec a capability-bearing file for an
+# unprivileged user (EPERM), so nmap would not even start. With the accepted zero-capability model we never
+# use those caps anyway (nmap falls back to -sT), so clearing them lets the binaries exec as plain programs.
+RUN getcap -r / 2>/dev/null | awk '{print $1}' | xargs -r -n1 setcap -r 2>/dev/null || true
+
 COPY --chmod=0755 docker/kali/bletiner-exec-launcher /usr/local/bin/bletiner-exec-launcher
 COPY --chmod=0755 docker/kali/container-healthcheck /usr/local/bin/container-healthcheck
 

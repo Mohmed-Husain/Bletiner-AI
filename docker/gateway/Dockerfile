@@ -17,6 +17,8 @@ COPY bletiner/network/sni.py bletiner/network/sni.py
 COPY bletiner/network/dns_filter.py bletiner/network/dns_filter.py
 COPY bletiner/network/proxy.py bletiner/network/proxy.py
 COPY bletiner/network/gateway_main.py bletiner/network/gateway_main.py
+COPY bletiner/network/gateway_server.py bletiner/network/gateway_server.py
+COPY bletiner/network/gateway_run.py bletiner/network/gateway_run.py
 ENV PYTHONPATH=/opt/bletiner
 
 COPY --chmod=0755 docker/gateway/entrypoint.sh /usr/local/bin/entrypoint.sh

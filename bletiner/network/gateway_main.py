@@ -63,9 +63,8 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - container 
     if not isinstance(subnet, ipaddress.IPv4Network):
         raise ValueError("internal_subnet must be IPv4")
     apply_policy(policy, internal_if=internal_if, upstream_if=upstream_if, internal_subnet=subnet)
-    # proxy + DNS servers would start here (see docker/gateway/entrypoint.sh for the live wiring).
-    READY_SENTINEL.parent.mkdir(parents=True, exist_ok=True)
-    READY_SENTINEL.write_text("ready\n")
+    # The ready sentinel is written by gateway_run AFTER the proxy/DNS sockets bind, so readiness never
+    # signals before the servers are actually listening (the entrypoint runs gateway_run next).
     sys.stdout.write("bletiner-gateway: policy applied, fail-closed FORWARD DROP active\n")
     return 0
 

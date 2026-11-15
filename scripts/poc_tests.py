@@ -24,6 +24,24 @@ def _blocked(lab: Lab, tid: str, name: str, argv: list[str], expected: str) -> R
     return Result(tid, name, " ".join(argv), expected, actual, verdict, evidence)
 
 
+def _no_leak(lab: Lab, tid: str, name: str, argv: list[str], expected: str) -> Result:  # pragma: no cover
+    """Negative test for connectionless traffic (UDP): the client exit code is meaningless, so the
+    authoritative signal is that the canary received nothing. TC-LAB-00 proves the canary observes leaks."""
+    before = lab.canary_leaks()
+    res = lab.kali_exec(argv)
+    new_leaks = lab.canary_leaks()[len(before) :].strip()
+    verdict = "PASS" if not new_leaks else "FAIL"
+    return Result(
+        tid,
+        name,
+        " ".join(argv),
+        expected,
+        f"exit={res.exit_code} canary_leak={bool(new_leaks)}",
+        verdict,
+        f"out={res.output.strip()[:120]!r} leaks={new_leaks[:120]!r}",
+    )
+
+
 def _allowed(
     lab: Lab, tid: str, name: str, argv: list[str], expected: str, needle: str
 ) -> Result:  # pragma: no cover
@@ -93,6 +111,7 @@ def execute_all(lab: Lab) -> list[Result]:  # pragma: no cover - requires docker
             "TC-EGRESS-02",
             "Unauthorized SNI rejected (+ authorized control)",
             "openssl s_client -servername {unauthorized|authorized}",
+            "unauthorized SNI handshake rejected; identical request with authorized SNI succeeds",
             f"bad_exit={bad.exit_code} good_exit={good.exit_code}",
             "PASS" if ok else "FAIL",
             f"bad={bad.output.strip()[:120]!r} good={good.output.strip()[:120]!r}",
@@ -106,6 +125,7 @@ def execute_all(lab: Lab) -> list[Result]:  # pragma: no cover - requires docker
             "TC-EGRESS-02b",
             "ClientHello with no SNI rejected",
             "openssl s_client -noservername",
+            "connection rejected (NO_SNI)",
             f"exit={nosni.exit_code}",
             "PASS" if nosni.exit_code != 0 or "alert" in nosni.output.lower() else "FAIL",
             nosni.output.strip()[:160],
@@ -133,6 +153,7 @@ def execute_all(lab: Lab) -> list[Result]:  # pragma: no cover - requires docker
             "TC-EGRESS-02c",
             "Plaintext HTTP out-of-scope Host rejected",
             "curl -H 'Host: unauthorized-tenant.test'",
+            "HTTP 403 Forbidden",
             f"http_code={code.output.strip()}",
             "PASS" if code.output.strip() == "403" else "FAIL",
             code.output.strip()[:80],
@@ -149,7 +170,7 @@ def execute_all(lab: Lab) -> list[Result]:  # pragma: no cover - requires docker
                 "sh",
                 "-c",
                 f"echo Q | openssl s_client -connect {CANARY_IP}:443 "
-                "-servername local-lab.test -verify_return_error 2>&1; true",
+                "-servername local-lab.test -verify_return_error 2>&1",
             ],
             "rejected (SNI_IP_MISMATCH), no canary leak",
         )
@@ -170,23 +191,33 @@ def execute_all(lab: Lab) -> list[Result]:  # pragma: no cover - requires docker
         )
     )
     r.append(
-        _blocked(
+        _no_leak(
             lab,
             "TC-EGRESS-04",
             "Direct UDP bypass dropped",
-            ["sh", "-c", "nc -u -w2 203.0.113.9 12345 </dev/null; echo done"],
-            "udp dropped, no canary leak",
+            ["sh", "-c", "nc -u -w2 203.0.113.9 12345 </dev/null"],
+            "udp dropped: no canary leak (UDP has no connection result to read)",
         )
     )
 
-    # TC-EGRESS-05 external resolver
+    # TC-EGRESS-05 external resolver: the gateway intercepts ALL port-53 traffic, so a query aimed at an
+    # external resolver is answered locally (NXDOMAIN for the out-of-scope name) and never reaches it. The
+    # pass condition is "intercepted (no usable record) AND no canary leak", NOT a client error -- dig exits
+    # 0 on an NXDOMAIN response.
+    before = lab.canary_leaks()
+    dns_res = lab.kali_exec(["dig", "+time=2", "+tries=1", "@203.0.113.9", "evil.invalid", "+short"])
+    new_leaks = lab.canary_leaks()[len(before) :].strip()
+    intercepted = not dns_res.output.strip()  # no A record returned for the out-of-scope name
+    verdict = "PASS" if intercepted and not new_leaks else "FAIL"
     r.append(
-        _blocked(
-            lab,
+        Result(
             "TC-EGRESS-05",
             "Direct external resolver intercepted",
-            ["dig", "+time=2", "+tries=1", "@203.0.113.9", "evil.invalid", "+short"],
-            "no answer / refused, no canary leak",
+            "dig @203.0.113.9 evil.invalid +short",
+            "query intercepted by gateway DNS (no record), no canary leak",
+            f"answer={dns_res.output.strip()[:60]!r} canary_leak={bool(new_leaks)}",
+            verdict,
+            f"leaks={new_leaks[:120]!r}",
         )
     )
 
@@ -259,8 +290,8 @@ def execute_all(lab: Lab) -> list[Result]:  # pragma: no cover - requires docker
             lab,
             "TC-FWD-02",
             "Dedicated IP unauthorized port dropped",
-            ["sh", "-c", f"nc -w2 {DEDICATED_IP} 9999 </dev/null; echo done"],
-            "dropped, no canary leak",
+            ["sh", "-c", f"nc -w2 {DEDICATED_IP} 9999 </dev/null"],
+            "dropped (unauthorized port), no canary leak",
         )
     )
 
@@ -271,6 +302,7 @@ def execute_all(lab: Lab) -> list[Result]:  # pragma: no cover - requires docker
             "TC-DNS-ECH-01",
             "HTTPS/type65 stripped (ADR-017)",
             "dig local-lab.test HTTPS",
+            "no type65 record in the answer",
             f"answer={ech.output.strip()[:80]!r}",
             "PASS" if not ech.output.strip() else "FAIL",
             ech.output.strip()[:160] or "empty answer",
@@ -294,6 +326,7 @@ def execute_all(lab: Lab) -> list[Result]:  # pragma: no cover - requires docker
             "TC-ROUTE-01",
             "Kali cannot modify routes",
             "ip route add ...",
+            "EPERM / Operation not permitted",
             f"exit={ro.exit_code}",
             "PASS" if ro.exit_code != 0 and "not permitted" in ro.output.lower() else "FAIL",
             ro.output.strip()[:160],
@@ -306,6 +339,7 @@ def execute_all(lab: Lab) -> list[Result]:  # pragma: no cover - requires docker
             "TC-ROUTE-02",
             "Default route is the gateway",
             "ip route show default",
+            f"default via {GATEWAY_IP}",
             rt.output.strip()[:80],
             "PASS" if f"default via {GATEWAY_IP}" in rt.output else "FAIL",
             rt.output.strip()[:160],
@@ -324,6 +358,7 @@ def execute_all(lab: Lab) -> list[Result]:  # pragma: no cover - requires docker
             "TC-SBX-05",
             "Command injection is literal argv",
             "nmap -sL 'x; id'",
+            "id not executed; treated as a literal hostname",
             f"exit={inj.exit_code}",
             "PASS" if "uid=" not in inj.output else "FAIL",
             inj.output.strip()[:160],
@@ -351,6 +386,7 @@ def _fail_closed(lab: Lab) -> Result:  # pragma: no cover
         "TC-EGRESS-08",
         "Gateway stopped -> fail-closed",
         "stop gateway; ping+curl",
+        "100% loss while gateway down; restored after restart",
         f"ping_exit={ping.exit_code} curl_exit={curl.exit_code}",
         "PASS" if blocked else "FAIL",
         ping.output.strip()[:160],
@@ -391,6 +427,7 @@ def _cap_result(cap, scan) -> Result:  # pragma: no cover
         "TC-CAP-01",
         "Zero added caps; unprivileged nmap -sT works",
         "grep Cap /proc/self/status; nmap -sT -Pn",
+        "all capability sets zero; connect scan exits 0",
         f"caps_all_zero={no_caps} connect_scan_exit={scan.exit_code}",
         "PASS" if ok else "FAIL",
         f"caps={cap.output.strip()[:120]!r} scan={scan.output.strip()[:120]!r}",

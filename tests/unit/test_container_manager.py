@@ -103,15 +103,17 @@ class TestExecRunner:
 
 
 class TestTopology:
-    def test_internal_is_internal_with_icc_on(self) -> None:
+    def test_internal_bridge_not_internal_but_icc_on(self) -> None:
         topo = _topo()
         kw = topo.internal.create_kwargs()
-        assert kw["internal"] is True
+        # R-32: internal:true breaks gateway-forwarded egress on Docker; fail-closed is via routing + caps.
+        assert kw["internal"] is False
         assert kw["options"]["com.docker.network.bridge.enable_icc"] == "true"  # R-10
         assert topo.gateway_ip == "172.30.0.254"
         assert topo.kali_ip == "172.30.0.2"
 
     def test_lab_upstream_is_internal(self) -> None:
+        # The upstream lab network stays internal:true so the lab has no public route at all.
         assert _topo().upstream.create_kwargs()["internal"] is True
 
     def test_route_assertion(self) -> None:

@@ -17,7 +17,14 @@ independent review of the documentation is `docs/16_REV31_RECONCILIATION.md`; re
 |---|---|---|
 | Tier A — documentation consistency | contradictions reconciled | **DONE** (docs/16) |
 | Tier B — implementation correctness | code + unit tests (mocked Docker, pure logic) | **PASS** — 127 tests, ruff + mypy --strict clean |
-| Tier C — empirical security properties | live Docker egress gate | **PENDING LAB EXECUTION** — no container runtime on this workstation (R-20) |
+| Tier C — empirical security properties | live Docker egress gate | **PASS (2026-11-15)** — `verify_gateway_poc.py` 23/23 PASS on Docker Desktop (Linux aarch64, server 29.9.3). Evidence `evidence/phase3/gate3_live_*.json` (gitignored; regenerate per environment). |
+
+> **Tier C update (2026-11-15):** Running the live gate on Docker surfaced real integration defects the
+> mocked tests could not: a missing gateway module in the image, gateway/Kali IP pinning, the
+> `internal: true` forwarding incompatibility (R-32), nmap's file capabilities blocking exec under
+> `no-new-privileges` (R-09 addendum), the dead canary, and several harness-assertion bugs. All were fixed;
+> the gate now passes 23/23 and `bletiner.agent.gate.is_gate3_certified()` returns True, which unlocks the
+> agent's live path. Certification is per-environment: a fresh checkout must re-run the gate on its own Docker.
 
 **The fail-closed network has NOT been empirically proven on this machine.** It cannot be: macOS 26.5 / arm64
 here has no Docker/Podman/Colima/OrbStack. The live gate is built and runnable; it reports every scenario
