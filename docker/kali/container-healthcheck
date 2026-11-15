@@ -1,0 +1,8 @@
+#!/bin/sh
+# DOC-04 section 10.1: workspace writable, pid budget healthy.
+set -eu
+touch /workspace/.healthcheck 2>/dev/null || exit 1
+rm -f /workspace/.healthcheck 2>/dev/null || true
+pids=$(ps -e --no-headers 2>/dev/null | wc -l || echo 0)
+[ "$pids" -lt 240 ] || exit 1
+exit 0

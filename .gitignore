@@ -28,3 +28,10 @@ htmlcov/
 .DS_Store
 Thumbs.db
 *.tmp
+
+# Local environment and generated evidence
+.venv/
+evidence/*
+!evidence/README.md
+.mypy_cache/
+.ruff_cache/

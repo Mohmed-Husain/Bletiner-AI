@@ -1,0 +1,13 @@
+#!/bin/sh
+# Structured-argv exec choke point (docs/16 R-09, accepted fallback).
+#
+# The container runs as the unprivileged bletiner user (UID 1000) with cap_drop=ALL and NO added
+# capabilities. This launcher does NOT elevate: it simply exec()s the given argv so every tool invocation
+# flows through one auditable, shell-free entry point. Raw-socket scans are unavailable by design; nmap
+# falls back to TCP connect scans (-sT), which need no capabilities.
+set -eu
+if [ "$#" -eq 0 ]; then
+    echo "bletiner-exec-launcher: no command given" >&2
+    exit 64
+fi
+exec "$@"

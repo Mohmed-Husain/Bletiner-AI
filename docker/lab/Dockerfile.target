@@ -1,0 +1,12 @@
+# Local lab target (docs/16 section 3). Self-signed cert with SAN for both the authorized and the
+# co-tenant hostname -> a non-MITM SNI gateway must distinguish them by SNI alone.
+FROM python:3.12-alpine
+RUN apk add --no-cache openssl
+RUN mkdir -p /certs && \
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout /certs/key.pem -out /certs/cert.pem \
+      -days 365 -subj "/CN=local-lab.test" \
+      -addext "subjectAltName=DNS:local-lab.test,DNS:unauthorized-tenant.test" && \
+    cat /certs/cert.pem /certs/key.pem > /certs/lab.pem
+COPY docker/lab/mock_target_app.py /app/mock_target_app.py
+ENV LAB_MODE=web LAB_CERT=/certs/lab.pem
+CMD ["python3", "/app/mock_target_app.py"]

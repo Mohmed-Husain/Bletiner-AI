@@ -1,0 +1,6 @@
+# Lab authoritative DNS (docs/16 section 3). Serves A records for the lab zone and a bogus HTTPS (type 65)
+# record for local-lab.test so the gateway's ADR-017 stripping is observable.
+FROM alpine:3.19
+RUN apk add --no-cache dnsmasq
+COPY docker/lab/dnsmasq.conf /etc/dnsmasq.conf
+CMD ["dnsmasq", "-k", "-C", "/etc/dnsmasq.conf"]

@@ -1,0 +1,24 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff check
+        entry: ruff check --fix
+        language: system
+        types: [python]
+      - id: ruff-format-check
+        name: ruff format --check
+        entry: ruff format --check
+        language: system
+        types: [python]
+      - id: mypy
+        name: mypy --strict
+        entry: mypy
+        language: system
+        pass_filenames: false
+      - id: no-shell-true
+        name: forbid shell=True / bash -c string commands
+        entry: "(shell=True|['\"]bash['\"],\\s*['\"]-c['\"]|['\"]sh['\"],\\s*['\"]-c['\"])"
+        language: pygrep
+        types: [python]
+        exclude: ^tests/unit/test_exec_runner\.py$

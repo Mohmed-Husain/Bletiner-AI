@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bletiner"
+version = "0.1.0"
+description = "Bletiner AI - autonomous, authorized security investigation workspace (Phases 0-3: sandbox + egress gateway)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+    "pydantic>=2.7,<3",
+    "docker>=7.1,<8",
+    "aiosqlite>=0.20",
+    "dnslib==0.9.24",
+]
+
+[project.optional-dependencies]
+# Phase 5+ only. Kept optional so Phases 0-3 do not pull a ~500 MB Qt toolchain.
+ui = ["pyside6>=6.7", "qasync>=0.27"]
+secrets = ["keyring>=25"]
+reporting = ["jinja2>=3.1"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pre-commit>=3.7",
+]
+
+[project.scripts]
+bletiner = "bletiner.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bletiner"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = [".venv", "evidence", "docs", "*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PL"]
+ignore = [
+    "PLR0913",  # many-argument constructors for Docker configs are explicit by design
+    "PLR2004",  # magic numbers are protocol constants (TLS/DNS) in parsers
+    "PLR0911",
+    "PLR0912",
+    "PLR0915",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S104", "S108", "PLC0415", "E501", "F841", "RUF043"]
+# The PoC harness provisions a throwaway lab and drives it live; it deliberately uses argv subprocesses,
+# local imports (to stay import-safe when Docker is absent), broad excepts, and lab temp paths.
+"scripts/**" = ["S603", "S607", "S604", "T201", "PLC0415", "S108", "SIM105", "PLR0917", "F841", "S112", "E501", "BLE001"]
+"docker/lab/**" = ["PLC0415", "S104"]
+"bletiner/network/gateway_main.py" = ["S603", "S607"]
+"bletiner/network/gateway_run.py" = ["S112"]
+"bletiner/container/security.py" = ["S108"]
+"bletiner/storage/artifacts.py" = ["S103"]
+"bletiner/container/manager.py" = ["PLC0415"]
+"bletiner/network/proxy.py" = ["S104"]
+"bletiner/network/dns_filter.py" = ["S104"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+packages = ["bletiner"]
+
+[[tool.mypy.overrides]]
+module = ["docker", "docker.*", "dnslib", "dnslib.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "live: requires a running Docker daemon (Tier C); never run in unit CI",
+]
+addopts = "-m 'not live'"
