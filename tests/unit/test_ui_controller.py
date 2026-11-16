@@ -1,205 +1,320 @@
-"""Unit tests for InvestigationController (Phase 5 UI bridge)."""
+"""Controller tests: real local engine path with a fake Docker container (no Docker daemon needed)."""
 
 from __future__ import annotations
 
-import asyncio
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
-from bletiner.agent.events import AgentEvent, AgentState
-from bletiner.agent.steering import SteeringVerdict
-from bletiner.ui.controller import (
-    InvestigationController,
-    _clean_target,
-    is_docker_available,
-)
+import pytest
+
+from bletiner.agent.events import AgentState
+from bletiner.ui import controller as controller_module
+from bletiner.ui.controller import InvestigationController, _find_kali_container
+
+NMAP_FAST = """Starting Nmap 7.99 ( https://nmap.org )
+Nmap scan report for 127.0.0.1
+Host is up (0.001s latency).
+PORT     STATE SERVICE
+22/tcp   open  ssh
+80/tcp   open  http
+443/tcp  open  https
+Nmap done: 1 IP address (1 host up) scanned in 0.20 seconds
+"""
+
+NMAP_SERVICE = """PORT     STATE SERVICE  VERSION
+22/tcp   open  ssh      OpenSSH 8.2p1 Ubuntu 4ubuntu0.5
+80/tcp   open  http     Apache httpd 2.4.41 ((Ubuntu))
+443/tcp  open  https    nginx 1.18.0 (Ubuntu)
+"""
+
+HTTP_HEAD = """HTTP/1.1 200 OK
+Server: Apache/2.4.41 (Ubuntu)
+X-Powered-By: PHP/7.4.3
+Content-Type: text/html
+"""
+
+WHATWEB = "http://127.0.0.1 [200 OK] Apache[2.4.41], PHP[7.4.3], jQuery[1.12.4]"
+
+NIKTO = """
++ Server: Apache/2.4.41 (Ubuntu)
++ The anti-clickjacking X-Frame-Options header is not present.
++ 1 host(s) tested
+"""
+
+DIG = ";; ANSWER SECTION:\n127.0.0.1. 0 IN A 127.0.0.1\n"
+WHOIS = "Domain Name: EXAMPLE.COM\nRegistrar: Test\n"
 
 
-def test_clean_target() -> None:
-    assert _clean_target("https://example.com/some/path") == "example.com"
-    assert _clean_target("http://192.168.1.1:8080/") == "192.168.1.1"
-    assert _clean_target("  sub.domain.test  ") == "sub.domain.test"
+class FakeExecResult:
+    def __init__(self, exit_code: int, output: tuple[bytes, bytes]) -> None:
+        self.exit_code = exit_code
+        self.output = output
 
 
-def test_docker_available_is_bool() -> None:
-    assert isinstance(is_docker_available(), bool)
+class FakeContainer:
+    id = "fake-kali"
+    name = "my-kali"
+    status = "running"
+
+    def exec_run(self, cmd=None, user=None, stdout=True, stderr=True, demux=True, **kwargs):
+        joined = " ".join(str(part) for part in (cmd or []))
+        text = "ok\n"
+        if "nmap" in joined and " -F" in joined:
+            text = NMAP_FAST
+        elif "nmap" in joined:
+            text = NMAP_SERVICE
+        elif "curl" in joined:
+            text = HTTP_HEAD
+        elif "whatweb" in joined:
+            text = WHATWEB
+        elif "nikto" in joined:
+            text = NIKTO
+        elif "dig" in joined:
+            text = DIG
+        elif "whois" in joined:
+            text = WHOIS
+        return FakeExecResult(0, (text.encode(), b""))
 
 
-class TestInvestigationController:
-    def test_initial_state(self, tmp_path: Path) -> None:
-        controller = InvestigationController(app_data_dir=tmp_path)
-        assert controller.current_state == AgentState.IDLE
-        assert not controller.is_running
-        assert not controller.is_paused
-        assert not controller.is_stopped
-        assert controller.current_paths is None
-        assert controller.last_result is None
+class FakeSettings:
+    def __init__(self, *, key: str = "") -> None:
+        self.settings = SimpleNamespace(
+            active_provider="deepseek",
+            active_model="deepseek-chat",
+            authorized_scope=["127.0.0.1", "example.com"],
+            ollama_base_url="http://localhost:11434/v1",
+        )
+        self.secrets = SimpleNamespace(backend="Windows DPAPI")
+        self._key = key
 
-    async def test_start_simulation_mode(self, tmp_path: Path) -> None:
-        events: list[AgentEvent] = []
-        tool_outputs: list[tuple[str, list[str], str]] = []
-        states: list[AgentState] = []
-        completed_results: list[object] = []
+    def get_api_key(self, provider: str) -> str:
+        return self._key
 
-        controller = InvestigationController(
-            app_data_dir=tmp_path,
-            on_event=events.append,
-            on_tool_output=lambda t, a, o: tool_outputs.append((t, a, o)),
-            on_state_change=states.append,
-            on_completed=lambda res, paths: completed_results.append((res, paths)),
+
+_OPEN_CONTROLLERS: list[InvestigationController] = []
+
+
+@pytest.fixture(autouse=True)
+async def _close_controllers() -> None:
+    yield
+    for controller in _OPEN_CONTROLLERS:
+        if controller._store is not None:
+            await controller._store.close()
+            controller._store = None
+    _OPEN_CONTROLLERS.clear()
+
+
+def make_controller(tmp_path: Path, fake_settings: FakeSettings | None = None) -> InvestigationController:
+    controller_module.get_settings_manager = lambda: fake_settings or FakeSettings()  # type: ignore[assignment]
+    controller = InvestigationController(
+        app_data_dir=tmp_path / "data",
+        evidence_dir=tmp_path / "evidence",
+        monitor_readiness=False,
+    )
+    _OPEN_CONTROLLERS.append(controller)
+    return controller
+
+
+class _FakeContainers:
+    def __init__(self, containers: list[object], images: list[object]) -> None:
+        self._containers = containers
+        self._images = images
+        self.created: list[dict[str, object]] = []
+
+    def list(self, all: bool = False) -> list[object]:
+        if all:
+            return list(self._containers)
+        return [c for c in self._containers if getattr(c, "status", "") == "running"]
+
+    def run(self, image: str, **kwargs: object) -> object:
+        self.created.append({"image": image, **kwargs})
+        container = SimpleNamespace(name="my-kali", status="running")
+        self._containers.append(container)
+        return container
+
+    def get(self, name: str) -> object:
+        raise KeyError(name)
+
+
+class _FakeDocker:
+    def __init__(self, containers: list[object], images: list[object]) -> None:
+        self.containers = _FakeContainers(containers, images)
+        self.images = SimpleNamespace(list=lambda: list(images))
+
+
+def test_find_kali_container_autoprovisions_from_local_image() -> None:
+    image = SimpleNamespace(tags=["bletiner-kali:latest"])
+    client = _FakeDocker(containers=[], images=[image])
+    container = _find_kali_container(client)
+    assert container is not None
+    assert client.containers.created
+    assert client.containers.created[0]["image"] == "bletiner-kali:latest"
+
+
+def test_find_kali_container_starts_stopped_container() -> None:
+    started: list[bool] = []
+
+    class Stopped:
+        name = "my-kali"
+        status = "exited"
+        image = SimpleNamespace(tags=[])
+
+        def start(self) -> None:
+            started.append(True)
+
+    client = _FakeDocker(containers=[Stopped()], images=[])
+    container = _find_kali_container(client)
+    assert container is not None
+    assert started == [True]
+
+
+def test_validate_target() -> None:
+    controller = InvestigationController(monitor_readiness=False)
+    assert controller.validate_target("https://example.com/path?q=1") == ("example.com", None)
+    assert controller.validate_target("Example.COM.") == ("example.com", None)
+    assert controller.validate_target("10.0.0.5") == ("10.0.0.5", None)
+    assert controller.validate_target("example.com:8443") == ("example.com", None)
+    cleaned, error = controller.validate_target("not a host")
+    assert cleaned is None and error is not None
+    cleaned, error = controller.validate_target("*.example.com")
+    assert cleaned is None and error is not None
+
+
+def test_target_scope_matching() -> None:
+    controller = InvestigationController(monitor_readiness=False)
+    authorized = ["example.com", "10.0.0.0/24", "127.0.0.1"]
+    assert controller.target_in_authorized_scope("example.com", authorized)
+    assert controller.target_in_authorized_scope("api.example.com", authorized)
+    assert controller.target_in_authorized_scope("10.0.0.42", authorized)
+    assert controller.target_in_authorized_scope("127.0.0.1", authorized)
+    assert not controller.target_in_authorized_scope("evil.example.net", authorized)
+    assert not controller.target_in_authorized_scope("11.0.0.42", authorized)
+
+
+def test_readiness_is_honest_when_everything_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(controller_module, "_client_or_none", lambda: None)
+    fake_settings = FakeSettings()
+    controller_module.get_settings_manager = lambda: fake_settings  # type: ignore[assignment]
+    controller = InvestigationController(
+        app_data_dir=tmp_path / "data", evidence_dir=tmp_path / "evidence", monitor_readiness=False
+    )
+    readiness = controller._probe_readiness()
+    assert readiness.docker_running is False
+    assert readiness.kali_container is None
+    assert readiness.local_ready is False
+    assert readiness.ai_ready is False
+    assert any("Docker" in note for note in readiness.notes)
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_invalid_target(tmp_path: Path) -> None:
+    controller = make_controller(tmp_path)
+    with pytest.raises(ValueError, match="single hostname"):
+        await controller.start(target="not a host", mode="basic")
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_out_of_scope_target(tmp_path: Path) -> None:
+    controller = make_controller(tmp_path)
+    with pytest.raises(ValueError, match="outside the authorized scope"):
+        await controller.start(target="evil.example.net", mode="basic")
+
+
+@pytest.mark.asyncio
+async def test_ai_start_requires_api_key(tmp_path: Path) -> None:
+    controller = make_controller(tmp_path, FakeSettings(key=""))
+    with pytest.raises(ValueError, match="No API key configured"):
+        await controller.start(
+            target="127.0.0.1", mode="basic", engine="ai", provider="deepseek", model="deepseek-chat"
         )
 
-        result = await controller.start("example.com", mode="deep", step_delay_s=0.0)
 
-        # Assert result and findings
-        assert result.stop_reason == "finish_called"
-        assert len(result.findings) >= 2
-        assert controller.current_state == AgentState.COMPLETED
-        assert controller.last_result is result
+@pytest.mark.asyncio
+async def test_start_fails_cleanly_without_sandbox(tmp_path: Path) -> None:
+    controller = make_controller(tmp_path)
+    controller.kali_container = lambda: None  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="Kali sandbox is not available"):
+        await controller.start(target="127.0.0.1", mode="basic", engine="local")
 
-        # Assert callbacks fired
-        assert len(events) > 0
-        assert len(tool_outputs) >= 3
-        assert AgentState.INITIALIZING in states
-        assert AgentState.PLANNING in states
-        assert AgentState.COMPLETED in states
-        assert len(completed_results) == 1
 
-        # Assert artifact files created and non-empty
-        paths = controller.current_paths
-        assert paths is not None
-        assert (paths.reports / "report.md").is_file()
-        assert (paths.reports / "report.html").is_file()
-        assert (paths.evidence / "findings.json").is_file()
-        assert (paths.logs / "agent_runtime.log").is_file()
-        assert (paths.root / "session.json").is_file()
+@pytest.mark.asyncio
+async def test_local_engine_end_to_end_writes_real_artifacts(tmp_path: Path) -> None:
+    controller = make_controller(tmp_path)
+    fake_container = FakeContainer()
+    controller.kali_container = lambda: fake_container  # type: ignore[method-assign]
+    completed: list[object] = []
+    states: list[AgentState] = []
+    tool_outputs: list[tuple[str, list[str], str]] = []
+    controller.on_completed.connect(completed.append)
+    controller.on_state_change.connect(states.append)
+    controller.on_tool_output.connect(lambda t, a, o: tool_outputs.append((t, a, o)))
 
-        md_text = (paths.reports / "report.md").read_text(encoding="utf-8")
-        assert "# Investigation Report: example.com" in md_text
-        assert "Outdated Apache" in md_text
+    outcome = await controller.start(target="127.0.0.1", mode="deep", engine="local")
 
-        html_text = (paths.reports / "report.html").read_text(encoding="utf-8")
-        assert "<!doctype html>" in html_text
-        assert "example.com" in html_text
+    assert outcome.status == "completed"
+    assert outcome.engine == "local"
+    assert outcome.target == "127.0.0.1"
+    assert outcome.findings
+    assert outcome.reports is not None
+    report_md, report_html = outcome.reports
+    assert report_md.exists() and "127.0.0.1" in report_md.read_text(encoding="utf-8")
+    assert report_html.exists() and "<html" in report_html.read_text(encoding="utf-8")
 
-    async def test_steering_injection(self, tmp_path: Path) -> None:
-        controller = InvestigationController(app_data_dir=tmp_path)
+    paths = outcome.paths
+    session = json.loads((paths.root / "session.json").read_text(encoding="utf-8"))
+    assert session["target"] == "127.0.0.1"
+    assert session["status"] == "completed"
+    assert session["engine"] == "local"
+    assert session["findings_count"] == len(outcome.findings)
 
-        # Before start, steering queue is None
-        bad_res = controller.submit_steering("test")
-        assert not bad_res.accepted
+    findings_json = json.loads((paths.evidence / "findings.json").read_text(encoding="utf-8"))
+    assert len(findings_json) == len(outcome.findings)
+    manifest = json.loads((paths.evidence / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest and all("sha256" in item for item in manifest)
+    assert (paths.logs / "agent_runtime.json").exists()
+    assert completed and completed[0] is outcome
+    assert AgentState.INITIALIZING in states
+    assert AgentState.COMPLETED in states
+    assert tool_outputs
+    assert controller.current_findings
+    assert controller.last_outcome is outcome
 
-        # Start an investigation with a valid target
-        await controller.start("local-lab.test", mode="basic", step_delay_s=0.0)
+    sessions = await controller.sessions()
+    assert any(summary.investigation_id == outcome.investigation_id for summary in sessions)
+    loaded = await controller.findings_for(outcome.investigation_id)
+    assert len(loaded) == len(outcome.findings)
 
-        # Active queue exists now
-        accepted = controller.submit_steering("Check port 80 headers")
-        assert accepted.accepted
-        assert accepted.verdict == SteeringVerdict.ACCEPTED
 
-        # Unsafe instruction rejected
-        unsafe = controller.submit_steering("sqlmap -u http://local-lab.test --os-shell")
-        assert not unsafe.accepted
-        assert unsafe.verdict == SteeringVerdict.REJECTED_SAFETY
+@pytest.mark.asyncio
+async def test_pause_resume_and_stop_states(tmp_path: Path) -> None:
+    controller = make_controller(tmp_path)
+    controller._current_state = AgentState.EXECUTING
+    assert controller.pause() is True
+    assert controller.current_state is AgentState.PAUSED
+    assert controller.pause() is False
+    assert controller.current_state is AgentState.EXECUTING
+    controller.stop()
+    assert controller.current_state is AgentState.STOPPED
 
-    def test_pause_and_resume(self, tmp_path: Path) -> None:
-        states: list[AgentState] = []
-        controller = InvestigationController(app_data_dir=tmp_path, on_state_change=states.append)
 
-        # Pause toggles
-        is_p = controller.pause()
-        assert is_p
-        assert controller.is_paused
-        assert controller.current_state == AgentState.PAUSED
-        assert AgentState.PAUSED in states
+@pytest.mark.asyncio
+async def test_terminal_offline_is_explicit(tmp_path: Path) -> None:
+    controller = make_controller(tmp_path)
+    controller.kali_container = lambda: None  # type: ignore[method-assign]
+    code, _stdout, stderr = await controller.execute_terminal_command("id")
+    assert code != 0
+    assert "Sandbox offline" in stderr
 
-        # Resume
-        controller.resume()
-        assert not controller.is_paused
-        assert controller.current_state != AgentState.PAUSED
 
-        # Pause again then toggle off via pause()
-        controller.pause()
-        assert controller.is_paused
-        controller.pause()
-        assert not controller.is_paused
-
-    def test_stop(self, tmp_path: Path) -> None:
-        states: list[AgentState] = []
-        controller = InvestigationController(app_data_dir=tmp_path, on_state_change=states.append)
-
-        controller.stop()
-        assert controller.is_stopped
-        assert controller.current_state == AgentState.STOPPED
-        assert AgentState.STOPPED in states
-
-    async def test_lifecycle_start_callbacks_steering_and_pausing(self, tmp_path: Path) -> None:
-        """Comprehensive verification of starting, event callbacks, steering injection, and pausing."""
-        events: list[AgentEvent] = []
-        tool_outputs: list[tuple[str, list[str], str]] = []
-        states: list[AgentState] = []
-        completed_results: list[object] = []
-
-        controller = InvestigationController(
-            app_data_dir=tmp_path,
-            on_event=events.append,
-            on_tool_output=lambda t, a, o: tool_outputs.append((t, a, o)),
-            on_state_change=states.append,
-            on_completed=lambda res, paths: completed_results.append((res, paths)),
-        )
-
-        task = asyncio.create_task(controller.start("scanme.nmap.org", mode="deep", step_delay_s=0.03))
-
-        # Allow the loop to spin up
-        await asyncio.sleep(0.01)
-        assert controller.is_running
-
-        # Verify mid-turn steering injection while running
-        steering = controller.submit_steering("Inspect SSL certificates on port 443")
-        assert steering.accepted
-        assert steering.verdict == SteeringVerdict.ACCEPTED
-
-        # Verify pause mechanism suspends loop
-        assert controller.pause() is True
-        assert controller.is_paused
-        assert controller.current_state == AgentState.PAUSED
-        assert AgentState.PAUSED in states
-
-        # Verify resume restores execution
-        await asyncio.sleep(0.02)
-        controller.resume()
-        assert not controller.is_paused
-
-        # Wait for investigation run to finish
-        result = await task
-
-        # Assert final result and events
-        assert result.stop_reason == "finish_called"
-        assert len(result.findings) >= 2
-        assert len(events) > 0
-        assert len(tool_outputs) > 0
-        assert AgentState.COMPLETED in states
-        assert len(completed_results) == 1
-
-        paths = controller.current_paths
-        assert paths is not None
-        assert (paths.reports / "report.md").is_file()
-        assert (paths.reports / "report.html").is_file()
-        assert (paths.evidence / "findings.json").is_file()
-
-    async def test_execute_terminal_command(self, tmp_path: Path) -> None:
-        controller = InvestigationController(app_data_dir=tmp_path)
-
-        # Empty command returns immediately
-        code, out, err = await controller.execute_terminal_command("")
-        assert code == 0
-        assert out == ""
-        assert err == ""
-
-        # Test command execution (live docker or offline notice)
-        code, out, err = await controller.execute_terminal_command("echo 'test-inline-terminal'")
-        if is_docker_available():
-            assert code == 0
-            assert "test-inline-terminal" in out
-        else:
-            assert code != 0
-            assert "Docker" in err
+@pytest.mark.asyncio
+async def test_delete_session_removes_investigation(tmp_path: Path) -> None:
+    controller = make_controller(tmp_path)
+    controller.kali_container = FakeContainer  # type: ignore[method-assign]
+    outcome = await controller.start(target="127.0.0.1", mode="basic", engine="local")
+    root = outcome.paths.root
+    assert root.exists()
+    await controller.delete_session(outcome.investigation_id)
+    assert not root.exists()

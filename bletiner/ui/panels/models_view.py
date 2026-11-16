@@ -1,305 +1,621 @@
-"""AI Model Selection Panel for Bletiner AI desktop."""
+"""Models and providers panel: real discovery, honest key status, real connection/probe tests.
+
+There are no hardcoded model cards here. The list is populated exclusively from the provider's own
+model-list endpoint (see :mod:`bletiner.providers.model_discovery`); a curated fallback list is shown
+only after a failed discovery and is labeled as unverified. Network calls run off the GUI thread.
+"""
 
 from __future__ import annotations
 
+import html
+import logging
+import time
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
-    QRadioButton,
-    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
-from bletiner.providers.http_transport import HttpTransport
+from bletiner.models.errors import ConfigurationError, ProviderError
+from bletiner.providers.model_discovery import (
+    BASE_URLS,
+    PROVIDERS,
+    curated_models,
+    discover_models,
+    models_url,
+    normalize_provider,
+    probe_model,
+)
+from bletiner.services.secrets import BACKEND_MEMORY
+from bletiner.ui import theme
+from bletiner.ui.panels.jobs import run_async
 from bletiner.ui.settings_manager import get_settings_manager
 
-AVAILABLE_MODELS = [
-    {
-        "id": "claude-3-5-sonnet",
-        "provider": "anthropic",
-        "name": "Claude 3.5 Sonnet",
-        "badge": "Recommended",
-        "badge_color": "green",
-        "desc": "Industry-leading tool use, autonomous reasoning, and fast execution for security tasks.",
-        "model_str": "claude-3-5-sonnet-20241022",
-    },
-    {
-        "id": "claude-opus",
-        "provider": "anthropic",
-        "name": "Claude Opus 4.6",
-        "badge": "Deep Reasoning",
-        "badge_color": "blue",
-        "desc": "Maximum depth reasoning for complex multi-stage attack paths and subtle vulnerabilities.",
-        "model_str": "claude-3-opus-20240229",
-    },
-    {
-        "id": "deepseek-v3",
-        "provider": "deepseek",
-        "name": "DeepSeek V3",
-        "badge": "MoE Reasoning",
-        "badge_color": "blue",
-        "desc": "High efficiency 671B MoE architecture with advanced code understanding and tool planning.",
-        "model_str": "deepseek-chat",
-    },
-    {
-        "id": "deepseek-r1",
-        "provider": "deepseek",
-        "name": "DeepSeek R1",
-        "badge": "Deep Reasoning",
-        "badge_color": "yellow",
-        "desc": "State-of-the-art reasoning model for chain-of-thought exploit analysis and vulnerability verification.",
-        "model_str": "deepseek-reasoner",
-    },
-    {
-        "id": "gpt-4o",
-        "provider": "openai",
-        "name": "OpenAI GPT-4o",
-        "badge": "High Speed",
-        "badge_color": "blue",
-        "desc": "Fast, highly capable multimodal reasoning with structured tool outputs.",
-        "model_str": "gpt-4o",
-    },
-    {
-        "id": "ollama",
-        "provider": "ollama",
-        "name": "Ollama Local (Offline)",
-        "badge": "100% Local / Free",
-        "badge_color": "green",
-        "desc": "Runs completely locally on your hardware (Llama 3 / Qwen 2.5). Zero API tokens or cost.",
-        "model_str": "llama3",
-    },
-    {
-        "id": "fake",
-        "provider": "fake",
-        "name": "Deterministic Simulation Lab",
-        "badge": "Offline Demo",
-        "badge_color": "gray",
-        "desc": "Built-in deterministic test lab for testing the UI and tools without API keys.",
-        "model_str": "simulation-lab",
-    },
-]
+logger = logging.getLogger(__name__)
+
+__all__ = ["ModelsPanel"]
+
+_INPUT_QSS = (
+    f"QLineEdit, QComboBox {{ background-color: {theme.BG_TERMINAL}; border: 1px solid "
+    f"{theme.BORDER_CARD}; border-radius: 8px; color: {theme.TEXT_PRIMARY}; padding: 8px 12px; "
+    "font-size: 13px; }"
+    f"QLineEdit:focus, QComboBox:focus {{ border: 1px solid {theme.BORDER_FOCUS}; }}"
+    "QComboBox::drop-down { border: none; width: 18px; }"
+    f"QComboBox QAbstractItemView {{ background-color: {theme.BG_CARD_INNER}; border: 1px solid "
+    f"{theme.BORDER_CARD}; color: {theme.TEXT_PRIMARY}; selection-background-color: {theme.BORDER_CARD}; }}"
+)
+_CARD_QSS = (
+    f"QFrame#panelCard {{ background-color: {theme.BG_CARD}; border: 1px solid {theme.BORDER_CARD}; "
+    "border-radius: 12px; }"
+)
+_SECONDARY_BTN_QSS = (
+    f"QPushButton {{ background-color: #1a1e28; border: 1px solid #2a3142; border-radius: 8px; "
+    f"color: {theme.ACCENT_BLUE}; font-weight: 600; font-size: 12px; padding: 8px 14px; }}"
+    "QPushButton:hover { background-color: #222838; border-color: #38bdf8; }"
+    "QPushButton:disabled { color: #64748b; border-color: #1c2130; }"
+)
+_PRIMARY_BTN_QSS = (
+    "QPushButton { background-color: #2563eb; border: 1px solid #3b82f6; border-radius: 8px; "
+    "color: #ffffff; font-weight: 700; font-size: 12px; padding: 8px 16px; }"
+    "QPushButton:hover { background-color: #1d4ed8; }"
+    "QPushButton:disabled { background-color: #1c2130; border-color: #2a3142; color: #64748b; }"
+)
+_LIST_QSS = (
+    f"QListWidget {{ background-color: {theme.BG_CARD_INNER}; border: 1px solid {theme.BORDER_CARD}; "
+    f"border-radius: 8px; color: {theme.TEXT_PRIMARY}; padding: 4px; outline: 0; }}"
+    "QListWidget::item { padding: 6px 8px; border-bottom: 1px solid #141722; border-radius: 4px; }"
+    "QListWidget::item:hover { background-color: #141824; }"
+    f"QListWidget::item:selected {{ background-color: {theme.BORDER_CARD}; }}"
+)
+
+_ROLE_MODEL = int(Qt.ItemDataRole.UserRole)
+_ROLE_PROVIDER = _ROLE_MODEL + 1
+_ROLE_CURATED = _ROLE_MODEL + 2
 
 
-class ModelCard(QFrame):
-    """Clickable card representing an AI model choice."""
-
-    selected = Signal(str, str)
-
-    def __init__(self, info: dict[str, Any], is_active: bool = False) -> None:
-        super().__init__()
-        self.info = info
-        self.model_id = info["id"]
-        self.provider = info["provider"]
-        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.set_active_style(is_active)
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(14)
-
-        self.radio = QRadioButton()
-        self.radio.setChecked(is_active)
-        self.radio.toggled.connect(self._on_radio_toggled)
-        layout.addWidget(self.radio)
-
-        text_col = QVBoxLayout()
-        text_col.setSpacing(4)
-
-        header_row = QHBoxLayout()
-        header_row.setSpacing(10)
-        name_lbl = QLabel(info["name"])
-        name_lbl.setStyleSheet("font-size: 14px; font-weight: 700; color: #ffffff;")
-        badge_lbl = QLabel(info["badge"])
-        badge_color = info["badge_color"]
-        badge_style = {
-            "green": "background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid #10b981;",
-            "blue": "background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid #38bdf8;",
-            "yellow": "background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid #f59e0b;",
-            "gray": "background: rgba(148, 163, 184, 0.12); color: #94a3b8; border: 1px solid #334155;",
-        }.get(badge_color, "color: #94a3b8;")
-        badge_lbl.setStyleSheet(f"{badge_style} border-radius: 10px; padding: 2px 10px; font-size: 11px; font-weight: 600;")
-        header_row.addWidget(name_lbl)
-        header_row.addWidget(badge_lbl)
-        header_row.addStretch(1)
-        text_col.addLayout(header_row)
-
-        desc_lbl = QLabel(info["desc"])
-        desc_lbl.setStyleSheet("font-size: 12px; color: #8892b0;")
-        desc_lbl.setWordWrap(True)
-        text_col.addWidget(desc_lbl)
-
-        # Key status
-        mgr = get_settings_manager()
-        has_key = bool(mgr.get_api_key(self.provider))
-        if self.provider == "fake":
-            key_status = "<span style='color:#10b981;'>✓ No key needed (Offline Lab)</span>"
-        elif self.provider == "ollama":
-            key_status = "<span style='color:#38bdf8;'>ℹ Connects to localhost:11434</span>"
-        elif has_key:
-            key_status = "<span style='color:#10b981;'>✓ API Key configured</span>"
-        else:
-            key_status = "<span style='color:#f59e0b;'>⚠️ API Key not set (Configure in Settings)</span>"
-
-        status_lbl = QLabel(key_status)
-        status_lbl.setStyleSheet("font-size: 11px; margin-top: 2px;")
-        text_col.addWidget(status_lbl)
-
-        layout.addLayout(text_col, 1)
-
-    def set_active_style(self, active: bool) -> None:
-        if active:
-            self.setStyleSheet(
-                "QFrame { background-color: rgba(37, 99, 235, 0.12); border: 2px solid #2563eb; border-radius: 12px; }"
-            )
-        else:
-            self.setStyleSheet(
-                "QFrame { background-color: #12151e; border: 1px solid #1c2130; border-radius: 12px; }"
-                "QFrame:hover { background-color: #161a26; border-color: #2a3346; }"
-            )
-
-    def mousePressEvent(self, event: Any) -> None:
-        self.radio.setChecked(True)
-        super().mousePressEvent(event)
-
-    def _on_radio_toggled(self, checked: bool) -> None:
-        self.set_active_style(checked)
-        if checked:
-            self.selected.emit(self.model_id, self.provider)
+def _muted(text: str, *, size: int = 12) -> QLabel:
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; font-size: {size}px;")
+    return label
 
 
 class ModelsPanel(QWidget):
-    """Full-page view to select and test the active AI model."""
+    """Select a provider, discover its real models, and persist the active model choice."""
 
     model_changed = Signal(str, str)  # (model_id, provider)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.mgr = get_settings_manager()
-        self.cards: list[ModelCard] = []
+        self._models: list[Any] = []
+        self._verified: set[str] = set()
+        self._fallback = False
+        self._busy = False
+        self._probe_armed = False
 
-        root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(24, 20, 24, 20)
-        root_layout.setSpacing(16)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 20, 24, 20)
+        root.setSpacing(14)
 
-        # Header
-        header_box = QVBoxLayout()
-        header_box.setSpacing(4)
-        title = QLabel("🧠  AI Model Selection")
-        title.setStyleSheet("font-size: 20px; font-weight: 800; color: #ffffff;")
-        subtitle = QLabel(
-            "Select the reasoning engine for autonomous tool dispatch, observation analysis, and report generation."
+        header = QHBoxLayout()
+        title = QLabel("Models & Providers")
+        title.setStyleSheet(f"color: {theme.TEXT_PRIMARY}; font-size: 20px; font-weight: 800;")
+        header.addWidget(title)
+        header.addStretch(1)
+        self.backend_lbl = QLabel("")
+        self.backend_lbl.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
+        header.addWidget(self.backend_lbl)
+        root.addLayout(header)
+        root.addWidget(
+            _muted(
+                "Discover the models a provider endpoint actually reports, then choose the one the AI "
+                "engine should use. Nothing here is invented: an empty list means nothing has been "
+                "discovered yet.",
+            )
         )
-        subtitle.setStyleSheet("font-size: 12px; color: #8892b0;")
-        header_box.addWidget(title)
-        header_box.addWidget(subtitle)
-        root_layout.addLayout(header_box)
 
-        # Scrollable cards
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        root.addWidget(self._build_provider_card())
+        root.addWidget(self._build_list_card(), 1)
 
-        cards_widget = QWidget()
-        cards_widget.setStyleSheet("background: transparent;")
-        cards_layout = QVBoxLayout(cards_widget)
-        cards_layout.setContentsMargins(0, 0, 0, 0)
-        cards_layout.setSpacing(10)
+        self.refresh()
 
-        active_id = self.mgr.settings.active_model
-        for info in AVAILABLE_MODELS:
-            is_active = info["id"] == active_id
-            card = ModelCard(info, is_active=is_active)
-            card.selected.connect(self._on_model_selected)
-            self.cards.append(card)
-            cards_layout.addWidget(card)
+    # -- construction -------------------------------------------------------------------------------
+    @staticmethod
+    def _card() -> QFrame:
+        card = QFrame()
+        card.setObjectName("panelCard")
+        card.setStyleSheet(_CARD_QSS)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+        return card
 
-        cards_layout.addStretch(1)
-        scroll.setWidget(cards_widget)
-        root_layout.addWidget(scroll, 1)
+    def _build_provider_card(self) -> QFrame:
+        card = self._card()
+        layout = card.layout()
 
-        # Bottom actions
-        action_bar = QFrame()
-        action_bar.setStyleSheet(
-            "background-color: #12151e; border: 1px solid #1c2130; border-radius: 10px; padding: 10px;"
-        )
-        act_layout = QHBoxLayout(action_bar)
-        act_layout.setContentsMargins(12, 6, 12, 6)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        provider_label = QLabel("Provider")
+        provider_label.setStyleSheet(f"color: {theme.TEXT_PRIMARY}; font-size: 12px; font-weight: 600;")
+        row.addWidget(provider_label)
+        self.provider_combo = QComboBox()
+        for provider, label in PROVIDERS.items():
+            self.provider_combo.addItem(label, provider)
+        self.provider_combo.setStyleSheet(_INPUT_QSS)
+        self.provider_combo.setMinimumWidth(240)
+        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        row.addWidget(self.provider_combo)
 
-        self.status_lbl = QLabel(f"Active Model: <b style='color:#38bdf8;'>{self.get_active_model_name()}</b>")
-        self.status_lbl.setStyleSheet("font-size: 13px; color: #f3f4f6;")
-        act_layout.addWidget(self.status_lbl)
-        act_layout.addStretch(1)
+        base_label = QLabel("Endpoint base URL")
+        base_label.setStyleSheet(f"color: {theme.TEXT_PRIMARY}; font-size: 12px; font-weight: 600;")
+        row.addWidget(base_label)
+        self.base_url_input = QLineEdit()
+        self.base_url_input.setStyleSheet(_INPUT_QSS)
+        self.base_url_input.setPlaceholderText("")
+        row.addWidget(self.base_url_input, 1)
+        layout.addLayout(row)
 
-        self.btn_test = QPushButton("⚡  Test Connection")
+        self.key_status_lbl = QLabel("")
+        self.key_status_lbl.setWordWrap(True)
+        layout.addWidget(self.key_status_lbl)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(10)
+        self.btn_discover = QPushButton("Discover models")
+        self.btn_discover.setStyleSheet(_PRIMARY_BTN_QSS)
+        self.btn_discover.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_discover.clicked.connect(lambda: self._run_discovery("discover"))
+        buttons.addWidget(self.btn_discover)
+
+        self.btn_test = QPushButton("Test connection")
+        self.btn_test.setStyleSheet(_SECONDARY_BTN_QSS)
         self.btn_test.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_test.setStyleSheet(
-            "QPushButton { background: #1a1e28; border: 1px solid #2a3142; border-radius: 8px; color: #38bdf8; font-weight: 600; padding: 8px 16px; }"
-            "QPushButton:hover { background: #222838; border-color: #38bdf8; }"
+        self.btn_test.clicked.connect(lambda: self._run_discovery("test"))
+        buttons.addWidget(self.btn_test)
+
+        self.btn_probe = QPushButton("Verify capabilities")
+        self.btn_probe.setStyleSheet(_SECONDARY_BTN_QSS)
+        self.btn_probe.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_probe.clicked.connect(self._on_probe_clicked)
+        buttons.addWidget(self.btn_probe)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+
+        self.status_lbl = QLabel("")
+        self.status_lbl.setWordWrap(True)
+        self.status_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.status_lbl.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; font-size: 12px;")
+        layout.addWidget(self.status_lbl)
+        return card
+
+    def _build_list_card(self) -> QFrame:
+        card = self._card()
+        layout = card.layout()
+
+        search_row = QHBoxLayout()
+        search_row.setSpacing(10)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search discovered models by id or name")
+        self.search_input.setStyleSheet(_INPUT_QSS)
+        self.search_input.textChanged.connect(self._apply_filter)
+        search_row.addWidget(self.search_input, 1)
+        self.filter_count_lbl = QLabel("0 models loaded")
+        self.filter_count_lbl.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
+        search_row.addWidget(self.filter_count_lbl)
+        layout.addLayout(search_row)
+
+        self.model_list = QListWidget()
+        self.model_list.setStyleSheet(_LIST_QSS)
+        self.model_list.itemSelectionChanged.connect(self._update_action_buttons)
+        self.model_list.itemDoubleClicked.connect(lambda _item: self._use_selected())
+        layout.addWidget(self.model_list, 1)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(10)
+        self.active_lbl = QLabel("")
+        self.active_lbl.setWordWrap(True)
+        self.active_lbl.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; font-size: 12px;")
+        footer.addWidget(self.active_lbl, 1)
+        self.btn_use = QPushButton("Use selected model")
+        self.btn_use.setStyleSheet(_PRIMARY_BTN_QSS)
+        self.btn_use.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_use.clicked.connect(self._use_selected)
+        footer.addWidget(self.btn_use)
+        layout.addLayout(footer)
+        return card
+
+    # -- helpers ------------------------------------------------------------------------------------
+    def _current_provider(self) -> str:
+        data = self.provider_combo.currentData()
+        return str(data) if data else ""
+
+    def _effective_base_url(self, provider: str) -> str | None:
+        """Base URL for *provider*: the field value when relevant, otherwise the stored/default one."""
+        typed = self.base_url_input.text().strip()
+        if provider == "custom":
+            return typed or self.mgr.settings.custom_base_url.strip() or None
+        if provider == "ollama":
+            return typed or self.mgr.settings.ollama_base_url.strip() or None
+        return typed or None
+
+    def _set_status(self, markup: str) -> None:
+        self.status_lbl.setText(markup)
+
+    def _show_info(self, text: str) -> None:
+        self._set_status(f"<span style='color:{theme.ACCENT_BLUE};'>{html.escape(text)}</span>")
+
+    def _show_success(self, text: str) -> None:
+        self._set_status(f"<span style='color:{theme.GREEN_FG};'>{html.escape(text)}</span>")
+
+    def _show_warning(self, text: str) -> None:
+        self._set_status(f"<span style='color:{theme.YELLOW_FG};'>{html.escape(text)}</span>")
+
+    def _show_error(self, text: str) -> None:
+        self._set_status(f"<span style='color:{theme.RED_FG};'>{html.escape(text)}</span>")
+
+    def _set_busy(self, busy: bool, message: str | None = None) -> None:
+        self._busy = busy
+        self.provider_combo.setEnabled(not busy)
+        self.base_url_input.setEnabled(not busy)
+        self.search_input.setEnabled(not busy)
+        self.btn_discover.setEnabled(not busy)
+        self.btn_test.setEnabled(not busy)
+        self._update_action_buttons()
+        if message:
+            self._show_info(message)
+
+    def _update_action_buttons(self) -> None:
+        has_selection = self._selected_item() is not None
+        self.btn_probe.setEnabled(not self._busy and has_selection)
+        self.btn_use.setEnabled(not self._busy and has_selection)
+
+    def _selected_item(self) -> QListWidgetItem | None:
+        items = self.model_list.selectedItems()
+        if not items:
+            return None
+        item = items[0]
+        return item if item.data(_ROLE_MODEL) else None
+
+    def _persist_settings(self) -> bool:
+        try:
+            self.mgr.save(self.mgr.settings)
+        except ConfigurationError as exc:
+            self._show_error(f"Cannot save settings: {exc}")
+            return False
+        return True
+
+    def _persist_base_url(self, provider: str) -> None:
+        typed = self.base_url_input.text().strip()
+        if provider == "custom":
+            self.mgr.settings.custom_base_url = typed
+        elif provider == "ollama" and typed:
+            self.mgr.settings.ollama_base_url = typed
+        self._persist_settings()
+
+    def _reset_probe_confirmation(self) -> None:
+        self._probe_armed = False
+        if hasattr(self, "btn_probe"):
+            self.btn_probe.setText("Verify capabilities")
+
+    # -- provider / key state -----------------------------------------------------------------------
+    def _on_provider_changed(self) -> None:
+        provider = self._current_provider()
+        self._reset_probe_confirmation()
+        if provider == "custom":
+            self.base_url_input.setPlaceholderText("Required, e.g. http://localhost:8080/v1")
+            self.base_url_input.setText(self.mgr.settings.custom_base_url)
+        elif provider == "ollama":
+            self.base_url_input.setPlaceholderText(BASE_URLS["ollama"])
+            self.base_url_input.setText(self.mgr.settings.ollama_base_url)
+        else:
+            self.base_url_input.setPlaceholderText(f"Default: {BASE_URLS.get(provider, '')}")
+            self.base_url_input.clear()
+        self._models = []
+        self._fallback = False
+        self._populate()
+        self._update_key_status()
+        self._update_active_label()
+        self._set_status("")
+        self._update_action_buttons()
+
+    def _update_key_status(self) -> None:
+        provider = self._current_provider()
+        if not provider:
+            self.key_status_lbl.setText("")
+            return
+        lines: list[str] = []
+        if provider == "ollama":
+            base = self._effective_base_url(provider) or BASE_URLS["ollama"]
+            lines.append(
+                f"<span style='color:{theme.ACCENT_BLUE};'>No API key required</span> "
+                f"<span style='color:{theme.TEXT_SECONDARY};'>- local daemon at {html.escape(base)}.</span>"
+            )
+        else:
+            configured, description = self.mgr.api_key_status(provider)
+            if configured:
+                lines.append(
+                    f"<span style='color:{theme.GREEN_FG};'>API key: {html.escape(description)}</span>"
+                )
+            elif provider == "custom":
+                lines.append(
+                    f"<span style='color:{theme.TEXT_SECONDARY};'>API key optional for custom endpoints; "
+                    "add one in Settings if this endpoint requires authentication.</span>"
+                )
+            else:
+                lines.append(
+                    f"<span style='color:{theme.YELLOW_FG};'>No API key configured for "
+                    f"{html.escape(PROVIDERS[provider])}</span> "
+                    f"<span style='color:{theme.TEXT_SECONDARY};'>- add it in Settings -> Providers.</span>"
+                )
+        if self.mgr.secrets.backend == BACKEND_MEMORY:
+            lines.append(
+                f"<span style='color:{theme.YELLOW_FG};'>Secret backend is Memory only: keys will not "
+                "persist after the app exits.</span>"
+            )
+        self.key_status_lbl.setText(" ".join(lines))
+        self.backend_lbl.setText(f"Secrets backend: {self.mgr.secrets.backend}")
+
+    def _update_active_label(self) -> None:
+        model = self.mgr.settings.active_model.strip()
+        provider = self.mgr.settings.active_provider.strip().lower()
+        if not model:
+            self.active_lbl.setText("Active model: none - discover and select a model.")
+            return
+        provider_label = PROVIDERS.get(provider, provider or "unknown")
+        ready, hint = self.mgr.provider_model_ready(provider, model) if provider else (False, "")
+        if ready:
+            marker = f"<span style='color:{theme.GREEN_FG};'>●</span>"
+            suffix = f"<span style='color:{theme.TEXT_SECONDARY};'> - {html.escape(hint)}</span>"
+        else:
+            marker = f"<span style='color:{theme.YELLOW_FG};'>●</span>"
+            suffix = f"<span style='color:{theme.YELLOW_FG};'> - {html.escape(hint)}</span>"
+        self.active_lbl.setText(
+            f"{marker} Active model: <b>{html.escape(model)}</b> ({html.escape(provider_label)}){suffix}"
         )
-        self.btn_test.clicked.connect(self._test_connection)
-        act_layout.addWidget(self.btn_test)
 
-        root_layout.addWidget(action_bar)
+    # -- discovery / probing ------------------------------------------------------------------------
+    def _run_discovery(self, kind: str) -> None:
+        if self._busy:
+            return
+        provider = self._current_provider()
+        if not provider:
+            self._show_error("Select a provider first.")
+            return
+        base_url = self._effective_base_url(provider)
+        try:
+            endpoint = models_url(provider, base_url)
+        except ProviderError as exc:
+            self._show_error(str(exc))
+            return
+        key = self.mgr.get_api_key(provider) or None
+        self._persist_base_url(provider)
+        self._set_busy(True, f"Querying {endpoint} ...")
+        started = time.perf_counter()
 
-    def get_active_model_name(self) -> str:
-        active_id = self.mgr.settings.active_model
-        for m in AVAILABLE_MODELS:
-            if m["id"] == active_id:
-                return m["name"]
-        return "Claude 3.5 Sonnet"
+        def work() -> tuple[list[Any], float]:
+            models = discover_models(provider, api_key=key, base_url=base_url)
+            return models, (time.perf_counter() - started) * 1000.0
 
-    def _on_model_selected(self, model_id: str, provider: str) -> None:
-        for card in self.cards:
-            if card.model_id != model_id:
-                card.radio.setChecked(False)
-                card.set_active_style(False)
-        self.mgr.settings.active_model = model_id
+        run_async(
+            self,
+            work,
+            lambda result, error: self._on_discovery_done(kind, provider, endpoint, result, error),
+        )
+
+    def _on_discovery_done(
+        self,
+        kind: str,
+        provider: str,
+        endpoint: str,
+        result: tuple[list[Any], float] | None,
+        error: Exception | None,
+    ) -> None:
+        self._set_busy(False)
+        if error is not None:
+            self._models = curated_models(provider)
+            self._fallback = bool(self._models)
+            self._populate()
+            message = f"{'Connection test' if kind == 'test' else 'Discovery'} failed: {error}"
+            if self._models:
+                message += (
+                    f" Showing the curated fallback list ({len(self._models)} commonly published ids, "
+                    "UNVERIFIED) - these were NOT returned by the provider."
+                )
+            else:
+                message += " No curated fallback exists for this provider; fix the error and retry."
+            self._show_error(message)
+            return
+        if result is None:
+            self._show_error("Discovery returned no result.")
+            return
+        models, elapsed_ms = result
+        self._models = list(models)
+        self._fallback = False
+        self._populate()
+        verb = "Connection OK" if kind == "test" else "Discovered"
+        self._show_success(f"{verb}: {len(models)} models via {endpoint} in {elapsed_ms:.0f} ms.")
+
+    def _probe_warning(self, provider: str, model_id: str) -> str:
+        if provider == "ollama":
+            return f"Verifying '{model_id}' sends one request to your local Ollama daemon; no provider cost."
+        return (
+            f"Verifying '{model_id}' sends exactly ONE minimal inference request (max 8 output tokens) "
+            f"to {PROVIDERS[provider]}. Your provider may bill a small amount. Click "
+            "'Confirm probe (1 request)' to authorize it."
+        )
+
+    def _on_probe_clicked(self) -> None:
+        if self._busy:
+            return
+        item = self._selected_item()
+        if item is None:
+            self._show_error("Select a discovered model first.")
+            return
+        model_id = str(item.data(_ROLE_MODEL))
+        provider = str(item.data(_ROLE_PROVIDER))
+        if not self._probe_armed:
+            self._probe_armed = True
+            self.btn_probe.setText("Confirm probe (1 request)")
+            self._show_warning(self._probe_warning(provider, model_id))
+            return
+        self._reset_probe_confirmation()
+        key = self.mgr.get_api_key(provider) or None
+        base_url = self._effective_base_url(provider)
+        self._set_busy(True, f"Sending one minimal request to {PROVIDERS[provider]} ({model_id}) ...")
+        run_async(
+            self,
+            lambda: probe_model(provider, model_id, api_key=key, base_url=base_url),
+            lambda result, error: self._on_probe_done(provider, model_id, result, error),
+        )
+
+    def _on_probe_done(
+        self,
+        provider: str,
+        model_id: str,
+        result: tuple[bool, str] | None,
+        error: Exception | None,
+    ) -> None:
+        self._set_busy(False)
+        if error is not None:
+            self._show_error(f"Probe failed: {error}")
+            return
+        if result is None:
+            self._show_error("Probe returned no result.")
+            return
+        ok, message = result
+        if ok:
+            self._verified.add(f"{provider}:{model_id}")
+            self._populate()
+            self._show_success(f"Verified: {message}")
+        else:
+            self._show_error(message)
+
+    # -- list rendering -----------------------------------------------------------------------------
+    def _populate(self) -> None:
+        self.model_list.clear()
+        if not self._models:
+            placeholder = QListWidgetItem(
+                "No models loaded. Choose a provider and press 'Discover models' - the empty list is honest, "
+                "nothing is preselected."
+            )
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            placeholder.setForeground(Qt.GlobalColor.gray)
+            self.model_list.addItem(placeholder)
+            self.filter_count_lbl.setText("0 models loaded")
+            self._update_action_buttons()
+            return
+        active_model = self.mgr.settings.active_model.strip()
+        active_provider = self.mgr.settings.active_provider.strip().lower()
+        for model in self._models:
+            is_active = model.model_id == active_model and model.provider == active_provider
+            marker = "●" if is_active else "○"
+            if model.display_name and model.display_name != model.model_id:
+                text = f"{marker}  {model.display_name}  ({model.model_id})"
+            else:
+                text = f"{marker}  {model.model_id}"
+            if self._fallback:
+                text += "   [curated fallback - unverified]"
+            if f"{model.provider}:{model.model_id}" in self._verified:
+                text += "   [verified]"
+            item = QListWidgetItem(text)
+            item.setData(_ROLE_MODEL, model.model_id)
+            item.setData(_ROLE_PROVIDER, model.provider)
+            item.setData(_ROLE_CURATED, self._fallback)
+            tooltip_lines = [f"provider: {model.provider}", f"model id: {model.model_id}"]
+            if model.context_window:
+                tooltip_lines.append(f"context window: {model.context_window}")
+            if self._fallback:
+                tooltip_lines.append("CURATED FALLBACK - not returned by the provider; verify before use.")
+            else:
+                tooltip_lines.append("Reported by the provider model-list endpoint.")
+            item.setToolTip("\n".join(tooltip_lines))
+            if self._fallback:
+                item.setForeground(Qt.GlobalColor.darkYellow)
+            self.model_list.addItem(item)
+        self._apply_filter()
+        self._update_action_buttons()
+
+    def _apply_filter(self) -> None:
+        if not self._models:
+            self.filter_count_lbl.setText("0 models loaded")
+            return
+        needle = self.search_input.text().strip().lower()
+        visible = 0
+        for row in range(self.model_list.count()):
+            item = self.model_list.item(row)
+            model_id = str(item.data(_ROLE_MODEL) or "")
+            text = item.text().lower()
+            matches = not needle or needle in model_id.lower() or needle in text
+            item.setHidden(not matches)
+            visible += int(matches)
+        if visible:
+            self.filter_count_lbl.setText(f"{visible} of {len(self._models)} models shown")
+        else:
+            self.filter_count_lbl.setText(f"No models match '{needle}'")
+
+    # -- actions ------------------------------------------------------------------------------------
+    def _use_selected(self) -> None:
+        if self._busy:
+            return
+        item = self._selected_item()
+        if item is None:
+            self._show_error("Select a model from the list first.")
+            return
+        model_id = str(item.data(_ROLE_MODEL))
+        provider = str(item.data(_ROLE_PROVIDER))
+        curated = bool(item.data(_ROLE_CURATED))
+        self._persist_base_url(provider)
         self.mgr.settings.active_provider = provider
-        self.mgr.save(self.mgr.settings)
-        self.status_lbl.setText(f"Active Model: <b style='color:#38bdf8;'>{self.get_active_model_name()}</b>")
+        self.mgr.settings.active_model = model_id
+        if not self._persist_settings():
+            return
+        self._populate()
+        self._update_active_label()
+        message = f"Active model set to '{model_id}' ({PROVIDERS.get(provider, provider)})."
+        if curated:
+            message += " This id comes from the curated fallback list - verify it exists before starting."
+        self._show_success(message)
         self.model_changed.emit(model_id, provider)
 
-    def _test_connection(self) -> None:
-        provider = self.mgr.settings.active_provider
-        if provider == "fake":
-            self.status_lbl.setText("Active Model: <b style='color:#10b981;'>Simulation Lab Ready (Offline)</b>")
-            return
+    # -- public surface (INTERFACES) -----------------------------------------------------------------
+    def get_active_model_name(self) -> str:
+        """Persisted model id, or "" when no model has been configured (never an invented default)."""
+        return self.mgr.settings.active_model.strip()
 
-        key = self.mgr.get_api_key(provider)
-        if not key and provider != "ollama":
-            self.status_lbl.setText(
-                f"<span style='color:#ef4444;'>❌ Missing API Key for {provider.title()}. Configure in Settings tab!</span>"
-            )
-            return
+    def refresh(self) -> None:
+        """Reload persisted selection/key state (no network requests)."""
+        settings = self.mgr.settings
+        provider = settings.active_provider.strip().lower()
+        if provider in PROVIDERS:
+            index = self.provider_combo.findData(provider)
+            if index >= 0 and index != self.provider_combo.currentIndex():
+                self.provider_combo.setCurrentIndex(index)
+        self._update_key_status()
+        self._update_active_label()
+        self._update_action_buttons()
+        if not self._models:
+            self._populate()
 
-        self.status_lbl.setText("Testing connection...")
+    def focus_provider(self, provider: str) -> None:
+        """Select *provider* in the drop-down (used by the New Investigation flow)."""
         try:
-            transport = HttpTransport(timeout_s=10.0)
-            if provider == "deepseek":
-                transport.post(
-                    "https://api.deepseek.com/chat/completions",
-                    {"Authorization": f"Bearer {key}"},
-                    {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
-                )
-            elif provider == "openai":
-                transport.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    {"Authorization": f"Bearer {key}"},
-                    {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
-                )
-            elif provider == "anthropic":
-                transport.post(
-                    "https://api.anthropic.com/v1/messages",
-                    {"x-api-key": key, "anthropic-version": "2023-06-01"},
-                    {"model": "claude-3-5-sonnet-20241022", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
-                )
-            self.status_lbl.setText("<span style='color:#10b981;'>✓ Connection verified successfully!</span>")
-        except Exception as exc:
-            self.status_lbl.setText(f"<span style='color:#ef4444;'>❌ Connection failed: {exc}</span>")
+            normalized = normalize_provider(provider)
+        except ProviderError:
+            return
+        index = self.provider_combo.findData(normalized)
+        if index >= 0:
+            self.provider_combo.setCurrentIndex(index)
+        self.provider_combo.setFocus(Qt.FocusReason.ShortcutFocusReason)

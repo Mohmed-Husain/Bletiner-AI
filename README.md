@@ -1,80 +1,136 @@
 # Bletiner AI
 
-> **Autonomous Security Investigation Desktop Application**  
-> Built with Python, PySide6, Docker Kali Linux Sandbox, and a Pi-Inspired Agent Runtime.
+> **Authorized Security Investigation Workspace** — a real desktop security workbench with a hardened Kali
+> sandbox, a deterministic local recon engine, and an optional autonomous LLM agent.
+
+This repository started as an implementation of a large engineering specification (docs/00-16). Version 0.2.0
+is the *readiness overhaul*: every demo/simulation path has been removed and the desktop UI is wired to the
+real backends. There is no fabricated tool output anywhere in the product.
 
 ---
 
-## Overview
+## What actually works
 
-**Bletiner AI** is an autonomous desktop application for authorized cybersecurity investigation. It operates inside dedicated, per-session Kali Linux containers, providing human operators with real-time operational feeds, an interactive Kali Linux terminal, structured finding management, and evidence-backed Markdown/HTML reporting.
+| Capability | Status | Notes |
+| --- | --- | --- |
+| Real interactive Kali terminal (PTY) | **Working** | Real /bin/bash PTY inside the sandbox container, ANSI rendering, arrow keys/Ctrl-C, resize, reconnect. Falls back to a clearly labelled command console if Docker is unavailable. |
+| Local recon engine (no API key, no LLM) | **Working** | Runs real dig, nmap, curl, whatweb, nikto, and nuclei (when installed) inside the Kali container, parses the real output into findings, and generates Markdown + HTML reports with SHA-256 evidence manifests. |
+| AI agent engine (autonomous) | **Working with a provider key** | Real provider calls (DeepSeek / OpenAI / Anthropic / Ollama / custom OpenAI-compatible endpoint) driving the pi-inspired agent loop over the real Kali tool executor. Refuses to run without a key or without the certified egress gate. |
+| Session history | **Working** | SQLite (~/.bletiner/bletiner.db) + self-contained session.json manifests per investigation. Works even if the database is missing, corrupt, or a legacy schema (the old DB is moved aside, never deleted). |
+| Findings + reports + evidence | **Working** | Live findings feed, severity/confidence badges, findings viewer, Markdown and air-gapped HTML reports, per-tool raw output evidence with hashes. |
+| Honest settings / credentials | **Working** | OS keyring when available, Windows DPAPI fallback otherwise. The Settings page shows the real backend; keys are never written as plaintext. |
+| Provider/model discovery | **Working** | Models are discovered from the provider (GET /models, Ollama /api/tags) and can be connection-tested; no invented model names. Curated fallbacks are explicitly labelled when discovery fails. |
+| Egress gateway + scope enforcement | **Implemented, live-certified on this host** | Gate 3 evidence lives in `evidence/phase3/` (local runtime evidence, not committed). The AI engine is code-gated on a genuine live pass. The local recon engine does not run the autonomous agent loop. |
+| Sandbox auto-provisioning | **Working** | The app finds a running sandbox, starts a stopped one, or creates a fresh `my-kali` container from a local `bletiner-kali` image. |
 
----
-
-## Architecture Highlights
-
-1. **Pi-Inspired Agent Harness:** Adapted from Earendil Works Pi (`pi-ai` provider protocol and `pi-agent` state machine).
-2. **Per-Investigation Kali Sandbox:** One dedicated Docker container and isolated workspace per investigation.
-3. **Fail-Closed Egress Gateway:** Dual-homed internal bridge (`internal: true`) and gateway proxy preventing out-of-scope traffic.
-4. **Desktop Presentation:** PySide6 with a modern 3-card workspace (Investigation, Kali Linux Terminal, Sessions & Files) and bottom steering control.
-5. **Dual Reporting Engine:** Evidence-hashed findings exported simultaneously to Markdown and standalone HTML.
-
----
-
-## Engineering Documentation Suite
-
-Complete, implementation-ready specifications are available in the [`docs/`](docs/) directory:
-
-- [**docs/README.md**](docs/README.md) — Documentation index and reading order.
-- [**docs/14_CLAUDE_CODE_IMPLEMENTATION_BRIEF.md**](docs/14_CLAUDE_CODE_IMPLEMENTATION_BRIEF.md) — Primary implementation brief for Claude Code.
-- [**docs/11_IMPLEMENTATION_ROADMAP.md**](docs/11_IMPLEMENTATION_ROADMAP.md) — 9-phase canonical engineering roadmap.
-- [**docs/15_DOCUMENTATION_AUDIT.md**](docs/15_DOCUMENTATION_AUDIT.md) — Quality Gate audit certifying all requirements.
-- [**docs/16_REV31_RECONCILIATION.md**](docs/16_REV31_RECONCILIATION.md) — Independent review: contradictions found and how each was resolved. **Read this before the code.**
-- [**scripts/verify_gateway_poc.py**](scripts/verify_gateway_poc.py) — Live egress gate (rewritten; no simulation mode).
+> The previous "Deterministic Simulation Lab", scripted tool output, hardcoded demo data, and the fake model
+> list have been deleted. If a prerequisite is missing, the UI says so and disables the action.
 
 ---
 
-## Implementation Status (Phases 0–8)
+## Quick start (Windows)
 
-All nine phases are implemented on `feat/phase0-3-sandbox-gateway`: setup, domain + SQLite persistence, the
-hardened Kali sandbox, the dual-homed fail-closed egress gateway, the pi-inspired agent runtime + providers +
-4-tier tool gate, the PySide6 UI view-models, findings + dual reporting, crash recovery, and the E2E module.
+Requirements:
 
-An independent review (`docs/16`) reconciled version/IP contradictions and flagged requirements that are
-impossible or insecure as written (non-root ambient capabilities, the mislabelled SNI test, two prioritization
-formulas). The original `verify_gateway_poc.py` printed hard-coded PASS without executing; it is rewritten into
-a real live gate with no simulation mode.
+- Windows 10/11 with **Docker Desktop** running.
+- **Python 3.11+** (3.13 recommended).
+- The hardened Kali sandbox image, either already present as `bletiner-kali:latest` or built once from this repo:
 
-**The autonomous agent cannot run against a live sandbox until the Gate 3 egress PoC passes on Docker** — this
-is enforced in code (`require_gate3_certified`), not just documented. So the agent is built and unit-tested, but
-its live path is gated off until the gate is certified on a Docker host.
+  ```powershell
+  docker build -f docker/kali/Dockerfile -t bletiner-kali:latest .
+  ```
 
-| Tier | What | Status |
-|---|---|---|
-| A — docs consistency | contradictions reconciled | DONE |
-| B — implementation | code + 209 unit tests, ruff + `mypy --strict` clean | PASS |
-| C — empirical / live | live Docker egress gate + E2E | **PENDING LAB EXECUTION** (no container runtime on the build host) |
+Launch:
 
-See [`docs/reports/PHASE_0-3_REPORT.md`](docs/reports/PHASE_0-3_REPORT.md) and
-[`docs/reports/PHASE_4-8_REPORT.md`](docs/reports/PHASE_4-8_REPORT.md) for the full reports.
-
-### Developer quickstart
-
-```bash
-python3.11 -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
+```powershell
+.\run_ui.bat
 ```
 
-```bash
-ruff check . && ruff format --check . && mypy && pytest
+The launcher creates a local `.venv`, installs dependencies on first run, and opens the workspace. To launch
+manually:
+
+```powershell
+.\.venv\Scripts\python.exe -m bletiner --ui
 ```
 
-```bash
-python scripts/verify_gateway_poc.py --build   # live egress gate; needs a running Docker daemon
+Check prerequisites without opening the UI:
+
+```powershell
+.\.venv\Scripts\python.exe -m bletiner --check
+```
+
+This prints a JSON readiness report (Docker daemon, Kali container, Gate 3 certification, secret backend, AI
+configuration) and exits non-zero when the local engine cannot run.
+
+### First run
+
+1. Open **Targets**, enter the host/domain/IP you are explicitly authorized to test, confirm the authorization
+   checkbox, and add it to the authorized scope (`Save target`).
+2. Go to **Investigation**, keep **Local recon** selected, and press **Start investigation**. Tool output
+   streams in the real Kali terminal; findings and reports appear as the run completes.
+3. Optional AI mode: open **Settings** and paste a provider API key (DeepSeek/OpenAI/Anthropic), open **Models**,
+   **Discover models**, select one, **Test connection**, then switch the engine toggle to **AI agent**.
+
+---
+
+## Architecture (short)
+
+- `bletiner/ui/` — PySide6 desktop shell, controller, real PTY terminal card, sessions/findings widgets, panels.
+- `bletiner/services/recon.py` — deterministic local recon engine (pure parsers, unit-tested).
+- `bletiner/services/session_store.py` — investigation/session persistence (SQLite + manifests).
+- `bletiner/agent/` — pi-inspired agent loop, events, steering, Gate 3 guard.
+- `bletiner/container/` — hardened Kali container lifecycle and non-blocking tool executor.
+- `bletiner/network/` — fail-closed egress gateway, DNS/TLS policy and scope enforcement.
+- `bletiner/providers/` — provider adapters, model discovery, HTTP transport.
+- `bletiner/reporting/` — sanitized Markdown/HTML report generation.
+
+All tool execution uses structured argv (no shell strings) as the unprivileged `bletiner` user; the operator
+terminal is the only interactive shell, and it runs inside the disposable sandbox container.
+
+---
+
+## Development
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[ui,dev,secrets]"
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m mypy
+```
+
+Read the readiness overhaul evidence: [docs/reports/FINAL_READINESS_REPORT.md](docs/reports/FINAL_READINESS_REPORT.md).
+
+Headless UI rendering (used for visual review in CI-less environments):
+
+```powershell
+.\.venv\Scripts\python.exe scripts\render_ui.py
 ```
 
 ---
 
-## License & Authorization Notice
+## Troubleshooting
 
-Bletiner AI is designed strictly for authorized security assessments on systems owned by the operator or under explicit written authorization.
+- **Docker shows Offline** — start Docker Desktop; the readiness probe refreshes every 8 seconds.
+- **"Kali sandbox container not found"** — build the image with the command above; the app will create and
+  start `my-kali` automatically. To diagnose: `docker ps -a --filter name=my-kali` and `docker images | findstr bletiner`.
+- **AI engine disabled** — you need a valid provider key (Settings → Test), a selected model (Models), and the
+  Gate 3 certification in `evidence/phase3/`. The local engine does not need any of these.
+- **API key rejected** — the Settings test shows the real provider error (401 etc.); the previously stored
+  placeholder key is invalid by design and is not used unless you replace it.
+- **Database notice** — a legacy `~/.bletiner/bletiner.db` is renamed to `bletiner.legacy-<timestamp>.db` and a
+  fresh database is created; session history keeps working from the per-investigation manifests.
+
+---
+
+## Verification harness
+
+`scripts/e2e_ui.py` drives the real MainWindow through a complete local investigation against the
+local Docker lab target (`bletiner-lab-target:poc`, HTTP :8080) and asserts findings, reports, evidence,
+terminal round-trip and sessions history. It temporarily adds the lab IP to the authorized scope and restores
+it afterwards; it never scans external targets.
+
+## Authorization notice
+
+Bletiner AI is designed strictly for authorized security assessments on systems owned by the operator or under
+explicit written authorization. Targets must be added to the authorized scope before any scan; the local engine
+still executes real network tools and must be used responsibly.
