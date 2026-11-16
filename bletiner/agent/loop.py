@@ -8,6 +8,7 @@ executor is injected by the service layer, which first calls ``require_gate3_cer
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
@@ -15,11 +16,12 @@ from typing import Protocol, runtime_checkable
 from bletiner.agent.events import AgentEvent, AgentState, EventType
 from bletiner.agent.state_tree import StateTree
 from bletiner.agent.steering import SteeringQueue
-from bletiner.models.errors import PolicyViolationError, Tier4ToolBlockedError
+from bletiner.models.errors import PolicyViolationError, ProviderError, Tier4ToolBlockedError
 from bletiner.providers.base import (
     AgentMessage,
     ModelProfile,
     ProviderAdapter,
+    ProviderResponse,
     Role,
     ToolSpec,
     ToolUse,
@@ -110,6 +112,8 @@ class AgentLoop:
         config: AgentConfig,
         steering: SteeringQueue | None = None,
         on_event: Callable[[AgentEvent], None] | None = None,
+        pause_event: asyncio.Event | None = None,
+        check_stopped: Callable[[], bool] | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -117,6 +121,8 @@ class AgentLoop:
         self._cfg = config
         self._steering = steering
         self._on_event = on_event
+        self._pause_event = pause_event
+        self._check_stopped = check_stopped
         self.tree = StateTree()
         self._events: list[AgentEvent] = []
         self._messages: list[AgentMessage] = []
@@ -132,6 +138,30 @@ class AgentLoop:
     def _transition(self, state: AgentState) -> None:
         self.tree.commit(state.value, {"messages": len(self._messages)}, context_tokens=self._tokens)
         self._emit(EventType.STATE_CHANGED, state=state.value)
+
+    async def _gate(self) -> None:
+        """Honor operator pause/stop at every safe boundary (between provider calls and tool calls)."""
+        if self._check_stopped is not None and self._check_stopped():
+            raise asyncio.CancelledError("Investigation stopped by operator.")
+        if self._pause_event is not None:
+            await self._pause_event.wait()
+        if self._check_stopped is not None and self._check_stopped():
+            raise asyncio.CancelledError("Investigation stopped by operator.")
+
+    async def _complete(self) -> ProviderResponse:
+        """Run the (blocking) provider HTTP call in a worker thread so the Qt event loop stays responsive."""
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._provider.complete,
+                    self._cfg.profile,
+                    self._messages,
+                    tools=self._tool_specs(),
+                ),
+                timeout=300.0,
+            )
+        except TimeoutError as exc:
+            raise ProviderError("Provider request timed out after 300 seconds.") from exc
 
     def _tool_specs(self) -> list[ToolSpec]:
         specs = [
@@ -155,18 +185,25 @@ class AgentLoop:
         iterations = 0
         for _ in range(self._cfg.budget.max_iterations):
             iterations += 1
+            await self._gate()
             self._apply_steering()
             if self._tokens >= self._cfg.budget.max_tokens:
                 stop_reason, state = "budget_exhausted", AgentState.REPORT_GENERATION
                 self._emit(EventType.BUDGET, reason="tokens", tokens=self._tokens)
                 break
             self._transition(AgentState.PLANNING)
-            response = self._provider.complete(self._cfg.profile, self._messages, tools=self._tool_specs())
+            try:
+                response = await self._complete()
+            except ProviderError as exc:
+                self._emit(EventType.ERROR, error=str(exc))
+                raise
             self._tokens += response.usage.total
             self._messages.append(response.message)
+            await self._gate()
             if not response.requested_tools:
                 stop_reason, state = "model_finished", AgentState.REPORT_GENERATION
                 break
+            await self._gate()
             finished = await self._handle_tools(response.requested_tools)
             if finished:
                 stop_reason, state = "finish_called", AgentState.REPORT_GENERATION
@@ -195,6 +232,7 @@ class AgentLoop:
 
     async def _handle_tools(self, tool_uses: tuple[ToolUse, ...]) -> bool:
         for tu in tool_uses:
+            await self._gate()
             if tu.name == FINISH:
                 return True
             if tu.name == RECORD_FINDING:

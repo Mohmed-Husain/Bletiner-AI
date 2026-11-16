@@ -31,7 +31,7 @@ from bletiner.models.errors import ConfigurationError, ProviderError
 from bletiner.providers.model_discovery import (
     BASE_URLS,
     PROVIDERS,
-    curated_models,
+    DiscoveredModel,
     discover_models,
     models_url,
     normalize_provider,
@@ -216,6 +216,23 @@ class ModelsPanel(QWidget):
         self.filter_count_lbl.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         search_row.addWidget(self.filter_count_lbl)
         layout.addLayout(search_row)
+
+        manual_row = QHBoxLayout()
+        manual_row.setSpacing(10)
+        self.manual_input = QLineEdit()
+        self.manual_input.setPlaceholderText(
+            "Optional: exact model id when discovery is unavailable (e.g. deepseek-chat)"
+        )
+        self.manual_input.setStyleSheet(_INPUT_QSS)
+        self.manual_input.returnPressed.connect(self._use_manual_model)
+        manual_row.addWidget(self.manual_input, 1)
+        self.btn_manual = QPushButton("Use this model id")
+        self.btn_manual.setStyleSheet(_SECONDARY_BTN_QSS)
+        self.btn_manual.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_manual.setToolTip("Persist an exact provider model id without discovery (unverified)")
+        self.btn_manual.clicked.connect(self._use_manual_model)
+        manual_row.addWidget(self.btn_manual)
+        layout.addLayout(manual_row)
 
         self.model_list = QListWidget()
         self.model_list.setStyleSheet(_LIST_QSS)
@@ -425,17 +442,20 @@ class ModelsPanel(QWidget):
     ) -> None:
         self._set_busy(False)
         if error is not None:
-            self._models = curated_models(provider)
-            self._fallback = bool(self._models)
+            self._models = []
+            self._fallback = False
             self._populate()
             message = f"{'Connection test' if kind == 'test' else 'Discovery'} failed: {error}"
-            if self._models:
+            if "401" in str(error) or "auth" in str(error).lower():
                 message += (
-                    f" Showing the curated fallback list ({len(self._models)} commonly published ids, "
-                    "UNVERIFIED) - these were NOT returned by the provider."
+                    " The provider rejected the API key, so nothing was listed. In Settings -> Providers, "
+                    "paste the key again and press 'Test & save' (that stores it), then retry discovery."
                 )
             else:
-                message += " No curated fallback exists for this provider; fix the error and retry."
+                message += (
+                    " Nothing was listed because the provider was not reached. Fix the error and retry, or "
+                    "persist an exact model id manually below."
+                )
             self._show_error(message)
             return
         if result is None:
@@ -588,6 +608,34 @@ class ModelsPanel(QWidget):
         if curated:
             message += " This id comes from the curated fallback list - verify it exists before starting."
         self._show_success(message)
+        self.model_changed.emit(model_id, provider)
+
+    def _use_manual_model(self) -> None:
+        """Persist an exact model id typed by the operator (used when discovery cannot list models)."""
+        if self._busy:
+            return
+        model_id = self.manual_input.text().strip()
+        provider = self._current_provider()
+        if not provider:
+            self._show_error("Select a provider first.")
+            return
+        if not model_id:
+            self._show_error("Enter an exact model id (e.g. deepseek-chat) first.")
+            return
+        self._persist_base_url(provider)
+        self.mgr.settings.active_provider = provider
+        self.mgr.settings.active_model = model_id
+        if not self._persist_settings():
+            return
+        self.manual_input.clear()
+        self._models = [DiscoveredModel(provider=provider, model_id=model_id, display_name=model_id)]
+        self._fallback = False
+        self._populate()
+        self._update_active_label()
+        self._show_warning(
+            f"Active model set to '{model_id}' from manual entry. It was NOT confirmed by the provider's "
+            "model list; use 'Test connection' to validate the key/model before starting an AI run."
+        )
         self.model_changed.emit(model_id, provider)
 
     # -- public surface (INTERFACES) -----------------------------------------------------------------

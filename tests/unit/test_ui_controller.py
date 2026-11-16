@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from bletiner.agent.events import AgentState
+from bletiner.providers.base import AgentMessage, ProviderResponse, Role, Usage
 from bletiner.ui import controller as controller_module
 from bletiner.ui.controller import InvestigationController, _find_kali_container
 
@@ -77,8 +80,36 @@ class FakeContainer:
         return FakeExecResult(0, (text.encode(), b""))
 
 
+class SlowProvider:
+    """Fake provider whose blocking call exercises the worker-thread + pause/stop gates."""
+
+    name = "stub"
+
+    def __init__(self, delay: float = 0.4) -> None:
+        self.delay = delay
+        self.calls = 0
+
+    def complete(self, profile, messages, *, tools=None, api_key=None):
+        self.calls += 1
+        time.sleep(self.delay)
+        return ProviderResponse(AgentMessage(Role.ASSISTANT, "analysis complete"), Usage(2, 3))
+
+
+def certify_gate(evidence_dir: Path) -> None:
+    """Write a genuine-looking passing live gate report so the AI path's guard is satisfied in-test."""
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    report = {
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "mode": "live",
+        "gate_passed": True,
+        "totals": {"total": 1, "pass": 1, "fail": 0, "not_run": 0},
+        "results": [],
+    }
+    (evidence_dir / "gate3_live_test.json").write_text(json.dumps(report), encoding="utf-8")
+
+
 class FakeSettings:
-    def __init__(self, *, key: str = "") -> None:
+    def __init__(self, *, key: str = "", validation: tuple[bool, str] = (True, "Key accepted - ok")) -> None:
         self.settings = SimpleNamespace(
             active_provider="deepseek",
             active_model="deepseek-chat",
@@ -87,9 +118,15 @@ class FakeSettings:
         )
         self.secrets = SimpleNamespace(backend="Windows DPAPI")
         self._key = key
+        self._validation = validation
+        self.validated: list[tuple[str, str]] = []
 
     def get_api_key(self, provider: str) -> str:
         return self._key
+
+    def validate_api_key(self, provider: str, key: str) -> tuple[bool, str]:
+        self.validated.append((provider, key))
+        return self._validation
 
 
 _OPEN_CONTROLLERS: list[InvestigationController] = []
@@ -233,6 +270,34 @@ async def test_ai_start_requires_api_key(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_ai_start_rejects_a_rejected_key_before_any_run(tmp_path: Path) -> None:
+    settings = FakeSettings(key="sk-invalid", validation=(False, "Authentication failed (HTTP 401)"))
+    controller = make_controller(tmp_path, settings)
+    with pytest.raises(ValueError, match="rejected the API key"):
+        await controller.start(
+            target="127.0.0.1",
+            mode="basic",
+            engine="ai",
+            provider="deepseek",
+            model="deepseek-chat",
+        )
+    assert settings.validated == [("deepseek", "sk-invalid")]
+    # The preflight runs before the session store and the sandbox are touched.
+    assert controller.current_paths is None
+    assert controller._store is None
+    assert controller.last_outcome is None
+
+
+@pytest.mark.asyncio
+async def test_preflight_helper_reports_real_result(tmp_path: Path) -> None:
+    settings = FakeSettings(key="sk-valid")
+    controller = make_controller(tmp_path, settings)
+    ok, detail = await controller._preflight_api_key("deepseek", "sk-valid")
+    assert ok is True
+    assert "Key accepted" in detail
+
+
+@pytest.mark.asyncio
 async def test_start_fails_cleanly_without_sandbox(tmp_path: Path) -> None:
     controller = make_controller(tmp_path)
     controller.kali_container = lambda: None  # type: ignore[method-assign]
@@ -286,6 +351,54 @@ async def test_local_engine_end_to_end_writes_real_artifacts(tmp_path: Path) -> 
     assert any(summary.investigation_id == outcome.investigation_id for summary in sessions)
     loaded = await controller.findings_for(outcome.investigation_id)
     assert len(loaded) == len(outcome.findings)
+
+
+@pytest.mark.asyncio
+async def test_ai_engine_can_be_paused_and_resumed(tmp_path: Path) -> None:
+    settings = FakeSettings(key="sk-valid")
+    controller = make_controller(tmp_path, settings)
+    certify_gate(tmp_path / "evidence")
+    controller.kali_container = FakeContainer  # type: ignore[method-assign]
+    provider = SlowProvider(delay=0.4)
+    controller._build_provider = lambda *args, **kwargs: provider  # type: ignore[method-assign]
+
+    task = asyncio.create_task(
+        controller.start(
+            target="example.com", mode="basic", engine="ai", provider="deepseek", model="deepseek-chat"
+        )
+    )
+    await asyncio.sleep(0.15)
+    assert controller.is_running
+    assert controller.pause() is True
+    assert controller.current_state is AgentState.PAUSED
+    await asyncio.sleep(0.5)  # longer than the provider delay: the loop must hold at the pause gate
+    assert not task.done()
+    controller.resume()
+    outcome = await asyncio.wait_for(task, timeout=15)
+    assert outcome.status == "completed"
+    assert outcome.engine == "ai"
+    assert provider.calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_ai_engine_stop_finalises_a_stopped_session(tmp_path: Path) -> None:
+    settings = FakeSettings(key="sk-valid")
+    controller = make_controller(tmp_path, settings)
+    certify_gate(tmp_path / "evidence")
+    controller.kali_container = FakeContainer  # type: ignore[method-assign]
+    controller._build_provider = lambda *args, **kwargs: SlowProvider(delay=0.4)  # type: ignore[method-assign]
+
+    task = asyncio.create_task(
+        controller.start(
+            target="example.com", mode="basic", engine="ai", provider="deepseek", model="deepseek-chat"
+        )
+    )
+    await asyncio.sleep(0.15)
+    assert controller.is_running
+    controller.stop()
+    outcome = await asyncio.wait_for(task, timeout=15)
+    assert outcome.status == "stopped"
+    assert outcome.stop_reason == "stopped_by_operator"
 
 
 @pytest.mark.asyncio

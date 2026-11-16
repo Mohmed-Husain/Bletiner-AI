@@ -86,3 +86,51 @@ investigation, real evidence tree, findings dialog, terminal, sessions history).
    if you want a clean history.
 6. The app assumes Docker Desktop is running; without it the terminal and both engines are disabled with an
    explanatory banner.
+
+---
+
+## 5. Post-release fixes — v0.2.1 (user-reported issues)
+
+The first end-to-end use on the operator's machine surfaced four real bugs. Root causes and fixes:
+
+1. **API key was validated but never stored.** Settings' "Test" button sent a real minimal request with the
+   *typed* key and reported success, but did not persist it; Models/AI kept using the old placeholder key
+   (`****-key`, HTTP 401). Fix: the button is now **"Test & save"** — on success the key is stored
+   (keyring/DPAPI) and settings persisted; on failure nothing is stored and the row says "NOT saved". Typing in a
+   key field shows an explicit "unsaved key" state.
+2. **Models page showed predefined "curated" ids after a failed discovery,** which looked invented. Fix: a failed
+   discovery now shows an honest empty list + the real error and a required fix; the curated fallback is no longer
+   auto-populated. Added an explicit **"Use this model id"** field for cases where a provider's model-list
+   endpoint is unavailable.
+3. **AI investigation started with a rejected key.** Fix: `controller.start()` now runs a **real API-key preflight**
+   (one minimal provider request) *before* creating any session or emitting run state. A rejected key raises a
+   clean "DeepSeek rejected the API key (HTTP 401...)" message, the UI returns to Idle, and no investigation is
+   created. Verified against the real provider with the stale placeholder key: blocked in <1 s, no session.
+4. **Pause/Stop did not work during an AI run.** Two independent causes: (a) the bottom-bar Pause/Stop buttons were
+   never enabled after construction; (b) the agent loop called the provider HTTP request synchronously on the Qt
+   event loop, freezing the whole UI during model generation. Fix: buttons are enabled for the whole live run
+   (Stop also while paused); provider calls now run in a worker thread; the loop checks pause/stop at every safe
+   boundary (before/after each provider call and each tool call); `stop()` cancels the active task, finalises partial
+   findings and emits a stopped outcome. Integration tests cover AI pause→resume and stop→stopped-session.
+
+### What "Local recon" means
+
+Local recon is the **deterministic, non-AI engine**: it runs a fixed, non-destructive playbook with real tools
+(`dig` → `nmap -sT -F` → service fingerprint → HTTP headers → `whatweb` → `nikto`, plus `nuclei` when installed) inside
+the Kali sandbox, parses the real output with rule-based analyzers, and produces findings/reports/evidence. It
+needs Docker + the Kali container only — no provider account, no token cost. "AI agent" instead asks a real LLM to
+choose tools and record findings, which needs a saved, validated API key (and the certified egress gate).
+
+### Additional verification after the fixes
+
+| Gate | Result |
+| --- | --- |
+| `pytest -q` | **473 passed, 2 deselected** |
+| `mypy` (strict) | no issues in 80 source files |
+| `ruff check` / `format --check` | clean |
+| AI preflight against the live provider with the stale key | **blocked before any session**, clean HTTP-401 message |
+| AI pause→resume / stop→stopped integration tests | pass (fake provider runs in the real agent loop + real controller path) |
+| Local recon end-to-end (headless MainWindow) | re-verified after the fixes (real tools, 10 findings, reports/evidence, terminal round-trip) |
+
+Screenshots for v0.2.1: `.handoff/shots/v021-*.png`.
+

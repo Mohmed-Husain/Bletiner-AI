@@ -1634,8 +1634,9 @@ class MainWindow(QMainWindow):
             from bletiner.ui.settings_manager import get_settings_manager
 
             manager = get_settings_manager()
-            provider = provider or str(getattr(manager.settings, "active_provider", "") or "")
-            model = model or str(getattr(manager.settings, "active_model", "") or "")
+            # Prefer the live settings over the (≤5 s old) readiness snapshot so a just-changed model/key is used.
+            provider = str(getattr(manager.settings, "active_provider", "") or "") or provider
+            model = str(getattr(manager.settings, "active_model", "") or "") or model
             key = manager.get_api_key(provider) if provider else ""
         except Exception:
             key = ""
@@ -1696,6 +1697,15 @@ class MainWindow(QMainWindow):
     def _handle_start_failure(self, error: BaseException) -> None:
         self._error_reported = error
         self._report_problem(str(error))
+        controller = self.controller
+        no_session_started = getattr(controller, "current_paths", None) is None
+        if no_session_started:
+            # Preflight failures (e.g. a rejected API key) never created a session: return to Idle instead
+            # of pretending an investigation started and failed.
+            self._reset_run_counters()
+            self.investigation.set_progress(0, "Idle")
+            self._apply_state(AgentState.IDLE)
+            return
         self._apply_state(AgentState.ERROR_HANDLING)
 
     def _apply_outcome(self, outcome: Any) -> None:
@@ -1789,6 +1799,14 @@ class MainWindow(QMainWindow):
         self._running = viewmodels.is_running_state(state)
         self.top_bar.set_state(state)
         self.bottom_bar.set_state(viewmodels.status_label(state), viewmodels.state_pill_variant(state))
+        # Pause/Stop must be usable for the whole live run, including while paused.
+        controls_active = state not in (
+            AgentState.IDLE,
+            AgentState.COMPLETED,
+            AgentState.STOPPED,
+            AgentState.ERROR_HANDLING,
+        )
+        self.bottom_bar.set_running(controls_active)
         self.bottom_bar.set_paused(state is AgentState.PAUSED)
         self.investigation.apply_state(state)
         self._refresh_progress_phase()

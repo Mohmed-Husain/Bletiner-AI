@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bletiner"
-version = "0.2.0"
+version = "0.2.1"
 description = "Bletiner AI - autonomous, authorized security investigation workspace (Phases 0-3: sandbox + egress gateway)"
 readme = "README.md"
 requires-python = ">=3.11"

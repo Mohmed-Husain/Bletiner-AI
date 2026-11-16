@@ -220,8 +220,12 @@ class SettingsPanel(QWidget):
         key_input.setEchoMode(QLineEdit.EchoMode.Password)
         key_input.setPlaceholderText(_KEY_PLACEHOLDERS[provider])
         key_input.setStyleSheet(_INPUT_QSS)
+        key_input.textChanged.connect(lambda text, p=provider: self._on_key_text_changed(p, text))
         row.addWidget(key_input, 1)
-        btn_test = QPushButton("Test")
+        btn_test = QPushButton("Test & save")
+        btn_test.setToolTip(
+            "Sends one minimal real request to validate the key; on success the key is stored persistently."
+        )
         btn_test.setStyleSheet(_SECONDARY_BTN_QSS)
         btn_test.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_test.clicked.connect(lambda _checked=False, p=provider: self._test_key(p))
@@ -299,6 +303,34 @@ class SettingsPanel(QWidget):
         return card
 
     # -- credential status --------------------------------------------------------------------------
+    def _on_key_text_changed(self, provider: str, text: str) -> None:
+        """A typed key is NOT stored until it is validated (Test & save) or Save credentials is pressed."""
+        if text.strip():
+            self._set_key_status(
+                provider,
+                "○ unsaved key - press 'Test & save' (validates it, then stores it)",
+                theme.YELLOW_FG,
+            )
+        else:
+            row = self._key_rows.get(provider)
+            if row is not None:
+                configured, description = self.mgr.api_key_status(provider)
+                if configured:
+                    self._set_key_status(provider, f"● {description}", theme.GREEN_FG)
+                elif provider == "custom":
+                    self._set_key_status(provider, f"○ optional - {description}", theme.TEXT_MUTED)
+                else:
+                    self._set_key_status(provider, f"○ {description}", theme.YELLOW_FG)
+
+    def _persist_validated_key(self, provider: str, key: str) -> tuple[bool, str]:
+        """Store a key that has just been validated. Returns (saved, message)."""
+        try:
+            self.mgr.set_api_key(provider, key)
+            self.mgr.save(self.mgr.settings)
+        except (ProviderError, SecretStorageError, ConfigurationError) as exc:
+            return False, f"validated, but saving failed: {exc}"
+        return True, f"stored via {self.mgr.secrets.backend}"
+
     def _set_key_status(self, provider: str, text: str, color: str) -> None:
         row = self._key_rows.get(provider)
         if row is None:
@@ -386,7 +418,7 @@ class SettingsPanel(QWidget):
 
         def done(result: tuple[bool, str] | None, error: Exception | None) -> None:
             row["test"].setEnabled(True)
-            row["test"].setText("Test")
+            row["test"].setText("Test & save")
             if error is not None:
                 self._set_key_status(provider, f"✕ Test failed: {error}", theme.RED_FG)
                 return
@@ -394,10 +426,29 @@ class SettingsPanel(QWidget):
                 self._set_key_status(provider, "✕ Test returned no result.", theme.RED_FG)
                 return
             ok, message = result
-            if ok:
-                self._set_key_status(provider, f"✓ {message}", theme.GREEN_FG)
-            else:
+            if not ok:
                 self._set_key_status(provider, f"✕ {message}", theme.RED_FG)
+                self._set_save_status("✕ Key NOT saved (validation failed).", theme.RED_FG)
+                return
+            # Success: a key that was only typed is now persisted, so Models/AI use the real key immediately.
+            if typed:
+                saved, save_note = self._persist_validated_key(provider, typed)
+                if not saved:
+                    self._set_key_status(provider, f"✓ validated, but NOT saved: {save_note}", theme.RED_FG)
+                    self._set_save_status(f"✕ {save_note}", theme.RED_FG)
+                    return
+                row["input"].clear()
+                self._refresh_key_statuses()
+                self._set_key_status(provider, f"✓ {message} - key saved ({save_note})", theme.GREEN_FG)
+                self._set_save_status(
+                    f"✓ {PROVIDERS.get(provider, provider)} key validated and saved ({save_note}).",
+                    theme.GREEN_FG,
+                )
+                self.settings_updated.emit()
+            else:
+                configured, description = self.mgr.api_key_status(provider)
+                suffix = f" - already stored ({description})" if configured else ""
+                self._set_key_status(provider, f"✓ {message}{suffix}", theme.GREEN_FG)
 
         run_async(self, lambda: self.mgr.validate_api_key(provider, key), done)
 

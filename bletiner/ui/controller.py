@@ -244,6 +244,23 @@ _HOST_RE = re.compile(
 )
 
 
+_PROVIDER_LABELS = {
+    "openai": "OpenAI",
+    "deepseek": "DeepSeek",
+    "anthropic": "Anthropic",
+    "ollama": "Ollama",
+    "custom": "Custom endpoint",
+    "openrouter": "OpenRouter",
+    "groq": "Groq",
+    "together": "Together AI",
+    "mistral": "Mistral",
+}
+
+
+def _provider_label(provider: str) -> str:
+    return _PROVIDER_LABELS.get(provider.strip().lower(), provider.title())
+
+
 def _build_scope(cleaned_target: str) -> ScopeSpec:
     """Build the AgentLoop scope. Raises ValueError when the target cannot be represented (e.g. loopback)."""
     try:
@@ -771,6 +788,7 @@ class InvestigationController(QObject):
         objective: str = "",
     ) -> InvestigationOutcome:
         self._reset_run_state()
+        self._active_task = asyncio.current_task()  # type: ignore[assignment]
         cleaned, error = self.validate_target(target)
         if error or cleaned is None:
             raise ValueError(error or "Invalid target.")
@@ -801,6 +819,22 @@ class InvestigationController(QObject):
                 raise ValueError(
                     f"No API key configured for {provider_name}. Add one in Settings, or use the Local recon engine."
                 )
+            # Preflight BEFORE any session/state is created: a rejected/stale key must never start a run.
+            ok, detail = await self._preflight_api_key(provider_name, str(key))
+            if not ok:
+                low = detail.lower()
+                if "401" in detail or "auth" in low or "invalid" in low or "api key" in low:
+                    message = (
+                        f"{_provider_label(provider_name)} rejected the API key (HTTP 401 - invalid or stale). "
+                        "Fix it in Settings -> Providers: paste the key and press 'Test & save' "
+                        "(that stores it), then start again. Or use Local recon."
+                    )
+                else:
+                    message = (
+                        f"{_provider_label(provider_name)} key preflight failed: {detail[:280]} "
+                        "Check the key and the selected model in Settings/Models, or use Local recon."
+                    )
+                raise ValueError(message)
             provider_adapter = self._build_provider(provider_name, str(key), model_name)
 
         container = await asyncio.to_thread(self.kali_container)
@@ -895,7 +929,11 @@ class InvestigationController(QObject):
                     on_event=self._handle_event,
                 )
                 agent_result: AgentResult = await service.start(
-                    request, executor, steering=self._steering_queue
+                    request,
+                    executor,
+                    steering=self._steering_queue,
+                    pause_event=self._pause_event,
+                    check_stopped=lambda: self._is_stopped,
                 )
                 iterations = agent_result.iterations
                 tokens = agent_result.tokens_used
@@ -938,6 +976,7 @@ class InvestigationController(QObject):
             raise
         finally:
             self._pause_event.set()
+            self._active_task = None
 
         duration = time.monotonic() - started
         reports = await self._write_artifacts(
@@ -1002,6 +1041,17 @@ class InvestigationController(QObject):
                 )
             )
         return findings
+
+    async def _preflight_api_key(self, provider: str, key: str) -> tuple[bool, str]:
+        """Validate the provider key with a real minimal request before starting an AI investigation."""
+        settings = get_settings_manager()
+        try:
+            result = await asyncio.to_thread(settings.validate_api_key, provider, key)
+        except Exception as exc:
+            return False, f"API key preflight failed unexpectedly: {exc}"
+        if isinstance(result, tuple) and len(result) == 2:
+            return bool(result[0]), str(result[1])
+        return False, "API key preflight returned no result."
 
     def _profile_for(self, provider: str, model: str) -> ModelProfile:
         settings = get_settings_manager()

@@ -6,5 +6,5 @@ This package root must stay dependency-free: the gateway image copies ``bletiner
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 SPEC_REVISION = "3.1 (reconciled, see docs/16_REV31_RECONCILIATION.md)"

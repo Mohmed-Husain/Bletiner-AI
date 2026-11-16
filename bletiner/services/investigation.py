@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from bletiner.agent.events import AgentEvent
 from bletiner.agent.gate import require_gate3_certified
@@ -51,6 +52,8 @@ class InvestigationService:
         executor: ToolExecutor,
         *,
         steering: SteeringQueue | None = None,
+        pause_event: Any | None = None,
+        check_stopped: Any | None = None,
     ) -> AgentResult:
         """Begin an investigation. Raises ``PoCVerificationFailedError`` if Gate 3 is not live-certified."""
         # INVIOLABLE: no live autonomous run until the egress gate has passed on real Docker.
@@ -66,5 +69,7 @@ class InvestigationService:
             config=request.config,
             steering=steering if steering is not None else SteeringQueue(request.scope),
             on_event=self._on_event,
+            pause_event=pause_event,
+            check_stopped=check_stopped,
         )
         return await loop.run(request.objective)

@@ -68,8 +68,10 @@ configuration) and exits non-zero when the local engine cannot run.
    checkbox, and add it to the authorized scope (`Save target`).
 2. Go to **Investigation**, keep **Local recon** selected, and press **Start investigation**. Tool output
    streams in the real Kali terminal; findings and reports appear as the run completes.
-3. Optional AI mode: open **Settings** and paste a provider API key (DeepSeek/OpenAI/Anthropic), open **Models**,
-   **Discover models**, select one, **Test connection**, then switch the engine toggle to **AI agent**.
+3. Optional AI mode: open **Settings**, paste a provider API key and press **Test & save** (it sends one minimal
+   real request and, only on success, stores the key), open **Models**, **Discover models**, select one, then
+   switch the engine toggle to **AI agent**. Starting an AI run re-validates the key first: a rejected key never
+   starts an investigation.
 
 ---
 
@@ -113,10 +115,12 @@ Headless UI rendering (used for visual review in CI-less environments):
 - **Docker shows Offline** — start Docker Desktop; the readiness probe refreshes every 8 seconds.
 - **"Kali sandbox container not found"** — build the image with the command above; the app will create and
   start `my-kali` automatically. To diagnose: `docker ps -a --filter name=my-kali` and `docker images | findstr bletiner`.
-- **AI engine disabled** — you need a valid provider key (Settings → Test), a selected model (Models), and the
-  Gate 3 certification in `evidence/phase3/`. The local engine does not need any of these.
-- **API key rejected** — the Settings test shows the real provider error (401 etc.); the previously stored
-  placeholder key is invalid by design and is not used unless you replace it.
+- **AI engine disabled** — you need a saved, validated provider key (Settings → Test & save), a selected model
+  (Models → Discover models) and the Gate 3 certification in @BT@evidence/phase3/@BT@. The local engine needs none of these.
+- **"Key accepted" but AI still says rejected** — the key must be *saved*: press **Test & save** in Settings.
+  The AI engine now preflights the key before starting, so a stale/rejected key is reported inline and no run starts.
+- **API key rejected** — press **Test & save** in Settings: validation failures are shown and never stored.
+  The previous placeholder key is still in the OS vault until you replace it.
 - **Database notice** — a legacy `~/.bletiner/bletiner.db` is renamed to `bletiner.legacy-<timestamp>.db` and a
   fresh database is created; session history keeps working from the per-investigation manifests.
 
