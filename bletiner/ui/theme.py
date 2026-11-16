@@ -156,6 +156,39 @@ QProgressBar#progressBar::chunk {
     border-radius: 3px;
 }
 
+QPushButton#btnStartScan, QPushButton#btnTopLaunch {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #10b981, stop:1 #059669);
+    border: 1px solid #10b981;
+    border-radius: 8px;
+    color: #ffffff;
+    font-weight: 700;
+    font-size: 12px;
+    padding: 6px 14px;
+}
+QPushButton#btnStartScan:hover, QPushButton#btnTopLaunch:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #047857);
+    border-color: #34d399;
+}
+QPushButton#btnStartScan:disabled, QPushButton#btnTopLaunch:disabled {
+    background: #1c2130;
+    border-color: #2a3142;
+    color: #64748b;
+}
+QPushButton#btnConfigTarget {
+    background-color: #1a1e28;
+    border: 1px solid #2a3142;
+    border-radius: 8px;
+    color: #8892b0;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 6px 10px;
+}
+QPushButton#btnConfigTarget:hover {
+    background-color: #222838;
+    color: #f3f4f6;
+    border-color: #38bdf8;
+}
+
 /* Findings Buttons */
 QPushButton#btnPotential {
     background-color: rgba(245, 158, 11, 0.12);
@@ -269,6 +302,53 @@ QPushButton.termBtn {
 QPushButton.termBtn:hover {
     background-color: #1c2130;
     color: #f3f4f6;
+}
+
+/* Terminal Command Input Bar */
+QFrame#terminalInputBar {
+    background-color: #08090d;
+    border: 1px solid #1e2434;
+    border-radius: 8px;
+    padding: 3px 8px;
+}
+QFrame#terminalInputBar:focus-within {
+    border: 1px solid #38bdf8;
+}
+QLineEdit#terminalCmdInput {
+    background-color: transparent;
+    border: none;
+    color: #f1f5f9;
+    font-family: "SF Mono", "JetBrains Mono", "Menlo", "Consolas", monospace;
+    font-size: 12px;
+    padding: 4px 6px;
+}
+QPushButton#btnRunCmd {
+    background-color: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    color: #38bdf8;
+    font-family: "SF Mono", "JetBrains Mono", monospace;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 4px 10px;
+}
+QPushButton#btnRunCmd:hover {
+    background-color: #0284c7;
+    color: #ffffff;
+    border-color: #38bdf8;
+}
+QPushButton#btnClearTerm {
+    background-color: transparent;
+    border: 1px solid #1e2434;
+    border-radius: 6px;
+    color: #64748b;
+    font-family: "SF Mono", "JetBrains Mono", monospace;
+    font-size: 11px;
+    padding: 4px 8px;
+}
+QPushButton#btnClearTerm:hover {
+    background-color: #1e293b;
+    color: #e2e8f0;
 }
 
 /* Steering Deck */

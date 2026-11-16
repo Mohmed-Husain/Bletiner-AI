@@ -130,3 +130,22 @@ class TestAnthropicAdapter:
         last_user = t.last["body"]["messages"][-1]
         assert last_user["content"][0]["type"] == "tool_result"
         assert last_user["content"][0]["tool_use_id"] == "t1"
+
+
+class TestDeepSeekAdapter:
+    def test_deepseek_default_url_and_auth(self) -> None:
+        from bletiner.providers.deepseek_adapter import DeepSeekAdapter
+
+        t = FakeTransport(
+            {
+                "choices": [{"message": {"content": "deepseek response"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 6},
+                "model": "deepseek-chat",
+            }
+        )
+        a = DeepSeekAdapter(t, api_key="sk-deepseek-key")
+        resp = a.complete(ModelProfile("deepseek", "deepseek-chat"), MSGS, tools=TOOLS)
+        assert t.last["url"] == "https://api.deepseek.com/chat/completions"
+        assert t.last["headers"]["Authorization"] == "Bearer sk-deepseek-key"
+        assert resp.message.content == "deepseek response"
+        assert resp.usage.total == 18

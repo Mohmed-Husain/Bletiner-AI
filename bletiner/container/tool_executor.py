@@ -26,6 +26,18 @@ class DockerToolExecutor:
         exit_code = int(getattr(result, "exit_code", result[0]))
         output = getattr(result, "output", result[1])
         stdout_b, stderr_b = output if isinstance(output, tuple) else (output, b"")
+
+        # If launcher returned 127 (e.g. launcher binary missing in container), fall back to direct argv
+        if exit_code == 127 and spec.use_launcher:
+            direct_spec = ExecSpec(argv=argv, timeout_s=timeout_s, use_launcher=False)
+            direct_kwargs = direct_spec.exec_create_kwargs(getattr(self._container, "id", "container"))
+            result = self._container.exec_run(
+                cmd=direct_kwargs["cmd"], user=direct_kwargs["user"], stdout=True, stderr=True, demux=True
+            )
+            exit_code = int(getattr(result, "exit_code", result[0]))
+            output = getattr(result, "output", result[1])
+            stdout_b, stderr_b = output if isinstance(output, tuple) else (output, b"")
+
         return ToolOutcome(
             exit_code=exit_code,
             stdout=(stdout_b or b"").decode("utf-8", "replace"),
