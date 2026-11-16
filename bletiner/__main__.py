@@ -18,6 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--version", action="store_true", help="print version information and exit")
+    parser.add_argument("--ui", action="store_true", help="launch the PySide6 desktop workspace")
     return parser
 
 
@@ -26,6 +27,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.version:
         sys.stdout.write(f"bletiner {__version__} (spec revision {SPEC_REVISION})\n")
         return 0
+    if args.ui:
+        from bletiner.ui.app import run
+
+        return run()
     build_parser().print_help()
     return 0
 
