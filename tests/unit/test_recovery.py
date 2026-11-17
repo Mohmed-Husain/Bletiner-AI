@@ -78,11 +78,11 @@ class TestSecrets:
 
     def test_store_round_trip_memory_backend(self) -> None:
         store = SecretStore(service="bletiner-test", use_keyring=False)
-        assert store.backend == "memory"
+        assert store.backend == "Memory only"
         store.set("openai", "sk-secret")
         assert store.get("openai") == "sk-secret"
         store.delete("openai")
         assert store.get("openai") is None
 
     def test_backend_reported(self) -> None:
-        assert SecretStore().backend in {"keyring", "memory"}
+        assert SecretStore().backend in {"OS keyring", "Windows DPAPI", "Memory only"}

@@ -25,8 +25,9 @@ API_VERSION = "2023-06-01"
 class AnthropicAdapter:
     name = "anthropic"
 
-    def __init__(self, transport: Transport) -> None:
+    def __init__(self, transport: Transport, api_key: str | None = None) -> None:
         self._transport = transport
+        self._api_key = api_key
 
     def _to_wire(self, messages: list[AgentMessage], tools: list[ToolSpec] | None) -> dict[str, Any]:
         system_parts: list[str] = []
@@ -100,8 +101,9 @@ class AnthropicAdapter:
         body["model"] = profile.model
         body["max_tokens"] = profile.max_output_tokens
         headers = {"Content-Type": "application/json", "anthropic-version": API_VERSION}
-        if api_key:
-            headers["x-api-key"] = api_key
+        effective_key = api_key or self._api_key
+        if effective_key:
+            headers["x-api-key"] = effective_key
         base = (profile.base_url or DEFAULT_BASE_URL).rstrip("/")
         try:
             payload = self._transport.post(f"{base}/messages", headers, body)

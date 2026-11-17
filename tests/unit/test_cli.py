@@ -21,4 +21,5 @@ def test_help_via_module() -> None:
         [sys.executable, "-m", "bletiner", "--help"], capture_output=True, text=True, check=False
     )
     assert proc.returncode == 0
-    assert "agent loop is intentionally not implemented" in proc.stdout
+    assert "authorized security investigation workspace" in proc.stdout
+    assert "--check" in proc.stdout and "--ui" in proc.stdout

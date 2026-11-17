@@ -1,11 +1,16 @@
 """PySide6 desktop bootstrap (DOC-05, DOC-14 Phase 5).
 
-Thin entry point. The Qt widgets live in ``bletiner.ui.desktop`` and are imported lazily, so the rest of the
-package (and the test suite) runs without a Qt toolchain. The headless, unit-tested view-models in
-``viewmodels.py`` supply all presentation logic.
+Owns the Qt + asyncio (qasync) lifecycle and graceful shutdown. The widgets live in
+bletiner.ui.desktop; the async bridge lives in bletiner.ui.controller.
 """
 
 from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+
+logger = logging.getLogger(__name__)
 
 
 def qt_available() -> bool:
@@ -17,14 +22,41 @@ def qt_available() -> bool:
 
 
 def run() -> int:  # pragma: no cover - requires a display + PySide6
-    """Launch the full 3-card desktop workspace. Returns the Qt exit code."""
+    """Launch the desktop workspace. Returns the process exit code."""
     try:
-        from bletiner.ui.desktop import launch
+        import qasync
+        from PySide6.QtWidgets import QApplication
     except ImportError as exc:
-        raise RuntimeError(
-            "PySide6/qasync are not installed. Install the UI extra: pip install -e '.[ui]'"
-        ) from exc
-    return launch()
+        sys.stderr.write(f'PySide6/qasync are not installed. Run: pip install -e ".[ui]"\n({exc})\n')
+        return 2
+
+    from bletiner.ui import theme
+    from bletiner.ui.controller import InvestigationController
+    from bletiner.ui.desktop import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    app.setApplicationName("Bletiner AI")
+    theme.apply_dark_theme(app)
+
+    controller = InvestigationController()
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
+    window = MainWindow(controller=controller)
+    window.show()
+
+    exit_code = 0
+    try:
+        with loop:
+            loop.run_forever()
+            loop.run_until_complete(controller.aclose())
+    except KeyboardInterrupt:
+        exit_code = 130
+    except Exception:
+        logger.exception("fatal UI error")
+        exit_code = 1
+    finally:
+        controller.shutdown()
+    return exit_code
 
 
 if __name__ == "__main__":  # pragma: no cover

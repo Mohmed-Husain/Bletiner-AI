@@ -27,8 +27,9 @@ DEFAULT_BASE_URL = "https://api.openai.com/v1"
 class OpenAICompatibleAdapter:
     name = "openai"
 
-    def __init__(self, transport: Transport) -> None:
+    def __init__(self, transport: Transport, api_key: str | None = None) -> None:
         self._transport = transport
+        self._api_key = api_key
 
     def _url(self, profile: ModelProfile) -> str:
         base = (profile.base_url or DEFAULT_BASE_URL).rstrip("/")
@@ -101,8 +102,9 @@ class OpenAICompatibleAdapter:
         body["model"] = profile.model
         body["max_tokens"] = profile.max_output_tokens
         headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        effective_key = api_key or self._api_key
+        if effective_key:
+            headers["Authorization"] = f"Bearer {effective_key}"
         try:
             payload = self._transport.post(self._url(profile), headers, body)
         except PermissionError as exc:

@@ -1,0 +1,1214 @@
+"""Durable investigation/session store: SQLite metadata plus per-investigation session.json.
+
+The desktop app persists every investigation twice, on purpose:
+
+* <app_data>/bletiner.db - normalized SQLite rows (investigations/sessions/findings) through
+  bletiner.storage.database.Database and the typed repositories.
+* <app_data>/investigations/<investigation_id>/session.json - a self-contained recovery manifest that
+  works even when the database is missing, corrupt or locked (DOC-07 sections 5-7 and 9.2).
+
+The filesystem manifest is authoritative for list_summaries(); SQLite history is merged in best-effort and
+manifest-only (legacy) sessions are upserted into it, so history survives either way. Database failures
+never abort an investigation: they are logged and exposed through db_error while the filesystem manifest
+keeps being written.
+
+All methods are async and do not block the Qt event loop; SQLite work goes through aiosqlite.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import json
+import logging
+import os
+import shutil
+import sqlite3
+import tempfile
+import uuid as uuid_module
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from bletiner.models.entities import (
+    Finding,
+    Investigation,
+    InvestigationDepth,
+    InvestigationStatus,
+    ProviderModelConfig,
+    Session,
+    SessionStatus,
+    TermsAcceptance,
+    VerificationStatus,
+    new_id,
+    utcnow,
+)
+from bletiner.models.errors import StorageError
+from bletiner.storage.artifacts import ArtifactStore, InvestigationPaths
+from bletiner.storage.database import CURRENT_SCHEMA_VERSION, Database
+from bletiner.storage.repositories import (
+    FindingRepository,
+    InvestigationRepository,
+    ProviderConfigRepository,
+    SessionRepository,
+    TermsAcceptanceRepository,
+)
+
+logger = logging.getLogger(__name__)
+
+SESSION_MANIFEST = "session.json"
+FINDINGS_ARTIFACT = "findings.json"
+
+# Canonical status vocabulary exposed to the UI (INTERFACES.md).
+LIVE_STATUS = "running"
+COMPLETED_STATUS = "completed"
+STOPPED_STATUS = "stopped"
+ERROR_STATUS = "error"
+INTERRUPTED_STATUS = "interrupted"
+SUMMARY_STATUSES = frozenset(
+    {LIVE_STATUS, COMPLETED_STATUS, STOPPED_STATUS, ERROR_STATUS, INTERRUPTED_STATUS}
+)
+
+# Status aliases accepted by SessionStore.complete() (callers may pass a stop_reason verbatim).
+_STATUS_ALIASES: dict[str, str] = {
+    "ok": COMPLETED_STATUS,
+    "success": COMPLETED_STATUS,
+    "finished": COMPLETED_STATUS,
+    "done": COMPLETED_STATUS,
+    "cancelled": STOPPED_STATUS,
+    "canceled": STOPPED_STATUS,
+    "aborted": STOPPED_STATUS,
+    "failed": ERROR_STATUS,
+    "failure": ERROR_STATUS,
+    "paused": INTERRUPTED_STATUS,
+}
+
+# Legacy manifests only carry stop_reason; this maps it onto the summary status vocabulary.
+_STOP_REASON_STATUS: dict[str, str] = {
+    "completed": COMPLETED_STATUS,
+    "budget_exhausted": COMPLETED_STATUS,
+    "model_finished": COMPLETED_STATUS,
+    "finish_called": COMPLETED_STATUS,
+    "iteration_budget": COMPLETED_STATUS,
+    "finished": COMPLETED_STATUS,
+    "stopped": STOPPED_STATUS,
+    "cancelled": STOPPED_STATUS,
+    "canceled": STOPPED_STATUS,
+    "interrupted": INTERRUPTED_STATUS,
+    "paused": INTERRUPTED_STATUS,
+    "error": ERROR_STATUS,
+    "failed": ERROR_STATUS,
+}
+
+_DB_SESSION_STATUS: dict[str, SessionStatus] = {
+    COMPLETED_STATUS: SessionStatus.COMPLETED,
+    STOPPED_STATUS: SessionStatus.STOPPED,
+    ERROR_STATUS: SessionStatus.FAILED,
+    INTERRUPTED_STATUS: SessionStatus.PAUSED,
+    LIVE_STATUS: SessionStatus.RUNNING,
+}
+
+_DB_INVESTIGATION_STATUS: dict[str, InvestigationStatus] = {
+    COMPLETED_STATUS: InvestigationStatus.COMPLETED,
+    STOPPED_STATUS: InvestigationStatus.TERMINATED,
+    ERROR_STATUS: InvestigationStatus.FAILED,
+    INTERRUPTED_STATUS: InvestigationStatus.PAUSED,
+    LIVE_STATUS: InvestigationStatus.ACTIVE,
+}
+
+# Sessions table status -> summary status (used when reconstructing history from SQLite alone).
+_SESSION_STATUS_TO_SUMMARY: dict[SessionStatus, str] = {
+    SessionStatus.COMPLETED: COMPLETED_STATUS,
+    SessionStatus.STOPPED: STOPPED_STATUS,
+    SessionStatus.FAILED: ERROR_STATUS,
+    SessionStatus.PAUSED: INTERRUPTED_STATUS,
+    SessionStatus.DRAFT: LIVE_STATUS,
+    SessionStatus.AWAITING_SETUP: LIVE_STATUS,
+    SessionStatus.INITIALIZING: LIVE_STATUS,
+    SessionStatus.RUNNING: LIVE_STATUS,
+    SessionStatus.PAUSING: LIVE_STATUS,
+    SessionStatus.RESUMING: LIVE_STATUS,
+    SessionStatus.STOPPING: LIVE_STATUS,
+}
+
+_TERMS_VERSION = "bletiner-desktop-authorized-use-v1"
+_TERMS_TEXT = (
+    "By starting an investigation the operator confirms that they own or are explicitly authorized to test "
+    "the selected target(s) and accepts responsibility for the network traffic generated by Bletiner AI."
+)
+
+# The schema requires positive values for these provider columns. SessionStore has no verified model
+# metadata, so it records the minimum sentinel instead of inventing vendor context windows. Capability
+# discovery is owned by bletiner.providers.model_discovery; these rows exist only to satisfy the sessions FK.
+_UNVERIFIED_TOKEN_LIMIT = 1
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _normalise_status(value: object) -> str:
+    """Map arbitrary caller strings onto the five-value summary vocabulary."""
+    text = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if text in SUMMARY_STATUSES:
+        return text
+    mapped = _STATUS_ALIASES.get(text)
+    if mapped is not None:
+        return mapped
+    return text or COMPLETED_STATUS
+
+
+def _legacy_status(data: Mapping[str, Any]) -> str:
+    """Legacy manifests have no status; infer it from stop_reason (INTERFACES.md)."""
+    raw_status = data.get("status")
+    if isinstance(raw_status, str) and raw_status.strip():
+        return _normalise_status(raw_status)
+    return _STOP_REASON_STATUS.get(str(data.get("stop_reason") or "").strip().lower(), COMPLETED_STATUS)
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _parse_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("+-").isdigit():
+        return int(value.strip())
+    return None
+
+
+def _parse_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _mtime(path: Path) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+    except OSError:
+        return None
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        return str(uuid_module.UUID(value)) == value.lower()
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def write_json_atomic(path: Path, payload: Any) -> None:
+    """Atomic write-flush-rename (DOC-07 section 9.1): readers never observe a truncated manifest."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".tmp_{path.stem}_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def read_json_object(path: Path) -> dict[str, Any] | None:
+    """Read a JSON object, returning None for missing/corrupt/non-object files (never raises)."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+@dataclass(frozen=True)
+class SessionSummary:
+    """One row of investigation history, merged from session.json and SQLite."""
+
+    investigation_id: str
+    session_id: str
+    target: str
+    mode: str
+    engine: str
+    provider: str
+    model: str
+    status: str
+    findings_total: int
+    findings_confirmed: int
+    started_at: datetime | None
+    completed_at: datetime | None
+    duration_s: float | None
+    tokens_used: int
+    root: Path
+    report_md: Path | None
+    report_html: Path | None
+    findings_json: Path | None
+
+
+@dataclass(frozen=True)
+class SessionRecord:
+    """Handle returned by SessionStore.create() and passed back to complete()/fail()."""
+
+    investigation_id: str
+    session_id: str
+    target: str
+    mode: str
+    engine: str
+    provider: str
+    model: str
+    paths: InvestigationPaths
+
+
+@dataclass(frozen=True)
+class _ScannedSummary:
+    summary: SessionSummary
+    sort_ts: datetime | None
+
+
+class SessionStore:
+    """Async persistence facade used by the investigation controller and the history UI."""
+
+    def __init__(self, app_data_dir: Path | None = None, evidence_dir: Path | None = None) -> None:
+        self._app_data_dir = Path(app_data_dir) if app_data_dir is not None else Path.home() / ".bletiner"
+        self._evidence_dir = Path(evidence_dir) if evidence_dir is not None else Path("evidence/phase3")
+        self._artifacts = ArtifactStore(self._app_data_dir)
+        self._db: Database | None = None
+        self._db_error: str | None = None
+        self._db_failed = False
+        self._database_notice: str | None = None
+        self._db_lock: asyncio.Lock | None = None
+        self._terms_acceptance_id: str | None = None
+        self._provider_config_ids: dict[tuple[str, str], str] = {}
+
+    # --- lifecycle -----------------------------------------------------------------------------------------
+    async def open(self) -> None:
+        """Create the storage layout and open (migrate) the SQLite database. Failures are reported."""
+        (self._app_data_dir / "investigations").mkdir(parents=True, exist_ok=True)
+        await self._ensure_db()
+
+    async def close(self) -> None:
+        if self._db is not None:
+            with contextlib.suppress(sqlite3.Error):
+                await self._db.close()
+            self._db = None
+        self._provider_config_ids.clear()
+        self._terms_acceptance_id = None
+
+    async def __aenter__(self) -> SessionStore:
+        await self.open()
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        await self.close()
+
+    @property
+    def app_data_dir(self) -> Path:
+        return self._app_data_dir
+
+    @property
+    def evidence_dir(self) -> Path:
+        return self._evidence_dir
+
+    @property
+    def db_path(self) -> Path:
+        return self._app_data_dir / "bletiner.db"
+
+    @property
+    def db_error(self) -> str | None:
+        """Last database failure (if any). The session manifest remains authoritative."""
+        return self._db_error
+
+    @property
+    def database_notice(self) -> str | None:
+        """Recovery notice: an incompatible user database was preserved and a fresh one created."""
+        return self._database_notice
+
+    async def _ensure_db(self) -> Database | None:
+        if self._db is not None or self._db_failed:
+            return self._db
+        if self._db_lock is None:
+            self._db_lock = asyncio.Lock()
+        async with self._db_lock:
+            if self._db is not None or self._db_failed:
+                return self._db  # type: ignore[unreachable]  # mypy cannot model the second lock check
+            try:
+                # aiosqlite worker threads are non-daemon: if Database.open() raised midway through its
+                # handshake the orphaned connection thread would keep the process alive at shutdown. Inspect
+                # the file first; incompatible/legacy databases are preserved (renamed, never deleted) and a
+                # fresh v2 database is created so session/finding rows persist again.
+                await asyncio.to_thread(self._prepare_database_file)
+                self._db = await Database.open(self.db_path)
+            except Exception as exc:  # corrupt/locked/incompatible database: degrade to manifest-only mode
+                self._db_failed = True
+                self._db_error = f"session database unavailable: {exc}"
+                logger.warning("SessionStore: %s (continuing with session.json manifests)", self._db_error)
+                return None
+            return self._db
+
+    def _prepare_database_file(self) -> None:
+        """Inspect an existing database file in a worker thread before Database.open() migrates it.
+
+        The desktop app shipped before the v2 schema, so ~/.bletiner/bletiner.db can be a legacy database
+        (user_version 0, unrelated tables) or a corrupt file. Database.open() would fail on it forever and
+        history would silently live only in session.json manifests. Instead the old file is preserved
+        (renamed aside - never deleted) and a fresh v2 database is opened so metadata persists again.
+        """
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.db_path.exists() or self.db_path.stat().st_size == 0:
+            return
+        try:
+            version, tables = self._inspect_database_file()
+        except sqlite3.DatabaseError as exc:
+            message = str(exc).lower()
+            if "not a database" not in message and "malformed" not in message:
+                raise
+            self._quarantine_database(f"corrupt session database ({exc})")
+            return
+        if version == CURRENT_SCHEMA_VERSION or (version == 0 and not tables):
+            return
+        self._quarantine_database(f"legacy/incompatible session database (schema version {version})")
+
+    def _inspect_database_file(self) -> tuple[int, set[str]]:
+        connection = sqlite3.connect(self.db_path, timeout=1.0)
+        try:
+            row = connection.execute("PRAGMA user_version").fetchone()
+            version = int(row[0]) if row is not None else 0
+            rows = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            return version, {str(item[0]) for item in rows}
+        finally:
+            connection.close()
+
+    def _quarantine_database(self, reason: str) -> None:
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        target = self._app_data_dir / f"bletiner.legacy-{stamp}.db"
+        counter = 1
+        while target.exists():
+            counter += 1
+            target = self._app_data_dir / f"bletiner.legacy-{stamp}-{counter}.db"
+        try:
+            os.replace(self.db_path, target)
+            for suffix in ("-wal", "-shm"):
+                sidecar = self.db_path.with_name(self.db_path.name + suffix)
+                if sidecar.exists():
+                    os.replace(sidecar, target.with_name(target.name + suffix))
+        except OSError as exc:
+            raise StorageError(
+                f"could not preserve the {reason}: {exc}. Move or remove {self.db_path} and retry."
+            ) from exc
+        self._database_notice = (
+            f"{reason}; preserved as {target.name} and a fresh history database was created. "
+            "Previous investigations remain browsable from their session folders."
+        )
+        logger.warning("SessionStore: %s", self._database_notice)
+
+    def _note_db_error(self, operation: str, exc: BaseException) -> None:
+        self._db_error = f"{operation} failed: {exc}"
+        logger.warning("SessionStore: %s", self._db_error)
+
+    # --- creation ------------------------------------------------------------------------------------------
+    async def create(
+        self,
+        *,
+        target: str,
+        mode: str,
+        engine: str,
+        provider: str = "",
+        model: str = "",
+        objective: str = "",
+    ) -> SessionRecord:
+        """Create the investigation directory, SQLite rows and the initial session.json manifest."""
+        investigation_id = new_id()
+        session_id = new_id()
+        paths = self._artifacts.create(investigation_id)
+        started_at = utcnow()
+        record = SessionRecord(
+            investigation_id=investigation_id,
+            session_id=session_id,
+            target=target,
+            mode=mode,
+            engine=engine,
+            provider=provider,
+            model=model,
+            paths=paths,
+        )
+        manifest = {
+            "investigation_id": investigation_id,
+            "session_id": session_id,
+            "target": target,
+            "mode": mode,
+            "engine": engine,
+            "provider": provider,
+            "model": model,
+            "objective": objective,
+            "status": LIVE_STATUS,
+            "stop_reason": "",
+            "iterations": 0,
+            "tokens_used": 0,
+            "findings_count": 0,
+            "findings_confirmed": 0,
+            "started_at": started_at.isoformat(),
+            "completed_at": None,
+            "duration_s": None,
+            "reports": [],
+        }
+        write_json_atomic(paths.root / SESSION_MANIFEST, manifest)
+        await self._insert_db_rows(record, started_at, objective)
+        return record
+
+    async def _insert_db_rows(self, record: SessionRecord, started_at: datetime, objective: str) -> None:
+        db = await self._ensure_db()
+        if db is None:
+            return
+        try:
+            terms_id = await self._ensure_terms_acceptance(db)
+            config_id = await self._ensure_provider_config(db, record.engine, record.provider, record.model)
+            await InvestigationRepository(db).add(
+                Investigation(
+                    investigation_id=record.investigation_id,
+                    title=f"Investigation: {record.target}",
+                    description=objective or None,
+                    primary_target=record.target or "unspecified",
+                    investigation_depth=_depth_for_mode(record.mode),
+                    status=InvestigationStatus.ACTIVE,
+                    created_at=started_at,
+                    updated_at=started_at,
+                    completed_at=None,
+                    terms_acceptance_id=terms_id,
+                )
+            )
+            await SessionRepository(db).add(
+                Session(
+                    session_id=record.session_id,
+                    investigation_id=record.investigation_id,
+                    provider_config_id=config_id,
+                    session_status=SessionStatus.RUNNING,
+                    relative_path=f"investigations/{record.investigation_id}",
+                    total_tokens_used=0,
+                    created_at=started_at,
+                    updated_at=started_at,
+                    ended_at=None,
+                )
+            )
+        except Exception as exc:
+            self._note_db_error("create", exc)
+
+    # --- findings ------------------------------------------------------------------------------------------
+    async def record_finding(self, finding: Finding) -> None:
+        """Persist one finding to SQLite and to <investigation>/evidence/findings.json."""
+        findings = self._read_findings_artifact(finding.investigation_id)
+        findings[finding.stable_finding_key] = finding
+        ordered = sorted(findings.values(), key=lambda f: f.first_detected_at)
+        self._write_findings_artifact(finding.investigation_id, ordered)
+        self._update_manifest_counts(finding.investigation_id, ordered)
+
+        db = await self._ensure_db()
+        if db is None:
+            return
+        try:
+            row = await db.fetchone(
+                "SELECT 1 FROM findings WHERE investigation_id = ? AND stable_finding_key = ? LIMIT 1",
+                (finding.investigation_id, finding.stable_finding_key),
+            )
+            if row is None:
+                await FindingRepository(db).add(finding)
+        except Exception as exc:
+            self._note_db_error("record_finding", exc)
+
+    async def _sync_findings(self, investigation_id: str, findings: Iterable[Finding]) -> list[Finding]:
+        """Persist the final findings list (artifact plus SQLite) and return it ordered."""
+        merged = self._read_findings_artifact(investigation_id)
+        for finding in findings:
+            merged[finding.stable_finding_key] = finding
+        ordered = sorted(merged.values(), key=lambda f: f.first_detected_at)
+        self._write_findings_artifact(investigation_id, ordered)
+        db = await self._ensure_db()
+        if db is None:
+            return ordered
+        try:
+            existing = {
+                str(row["stable_finding_key"])
+                for row in await db.fetchall(
+                    "SELECT stable_finding_key FROM findings WHERE investigation_id = ?",
+                    (investigation_id,),
+                )
+            }
+            for finding in ordered:
+                if finding.stable_finding_key not in existing:
+                    await FindingRepository(db).add(finding)
+        except Exception as exc:
+            self._note_db_error("complete_findings", exc)
+        return ordered
+
+    def _read_findings_artifact(self, investigation_id: str) -> dict[str, Finding]:
+        """Tolerant read of evidence/findings.json -> {stable_key: Finding}; malformed entries skipped."""
+        found: dict[str, Finding] = {}
+        path = self._findings_artifact_path(investigation_id)
+        if path is None:
+            return found
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return found
+        if not isinstance(data, list):
+            return found
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            try:
+                finding = Finding.model_validate(item)
+            except Exception:
+                logger.debug("Skipping malformed finding entry in %s", path)
+                continue
+            found[finding.stable_finding_key] = finding
+        return found
+
+    def _write_findings_artifact(self, investigation_id: str, findings: Sequence[Finding]) -> None:
+        try:
+            paths = self._artifacts.paths_for(investigation_id)
+        except StorageError:
+            logger.warning("Cannot persist findings: invalid investigation id %r", investigation_id)
+            return
+        paths.evidence.mkdir(parents=True, exist_ok=True)
+        payload = [finding.model_dump(mode="json") for finding in findings]
+        write_json_atomic(paths.evidence / FINDINGS_ARTIFACT, payload)
+
+    def _findings_artifact_path(self, investigation_id: str) -> Path | None:
+        try:
+            return self._artifacts.paths_for(investigation_id).evidence / FINDINGS_ARTIFACT
+        except StorageError:
+            return None
+
+    def _update_manifest_counts(self, investigation_id: str, findings: Sequence[Finding]) -> None:
+        """Keep session.json counts truthful while a run is still in progress."""
+        try:
+            manifest_path = self._artifacts.paths_for(investigation_id).root / SESSION_MANIFEST
+        except StorageError:
+            return
+        manifest = read_json_object(manifest_path)
+        if manifest is None:
+            return
+        manifest["findings_count"] = len(findings)
+        manifest["findings_confirmed"] = sum(
+            1 for f in findings if f.verification_status is VerificationStatus.VERIFIED
+        )
+        with contextlib.suppress(OSError):
+            write_json_atomic(manifest_path, manifest)
+
+    # --- completion / failure -----------------------------------------------------------------------------
+    async def complete(
+        self,
+        record: SessionRecord,
+        *,
+        status: str,
+        stop_reason: str,
+        iterations: int,
+        tokens_used: int,
+        findings: Sequence[Finding],
+        reports: Sequence[Path] | None,
+    ) -> None:
+        """Finalize a session: durable manifest, findings artifact and SQLite status/tokens."""
+        summary_status = _normalise_status(status)
+        if summary_status not in SUMMARY_STATUSES:
+            raise StorageError(f"unknown session status: {status!r}")
+        completed_at = utcnow()
+        manifest = self._read_manifest(record.paths) or {}
+        started_at = _parse_timestamp(manifest.get("started_at"))
+        duration_s = round((completed_at - started_at).total_seconds(), 2) if started_at else None
+        persisted = await self._sync_findings(record.investigation_id, findings)
+        report_paths = [Path(p) for p in (reports or ())]
+        manifest.update(
+            {
+                "investigation_id": record.investigation_id,
+                "session_id": record.session_id,
+                "target": record.target,
+                "mode": record.mode,
+                "engine": record.engine,
+                "provider": record.provider,
+                "model": record.model,
+                "status": summary_status,
+                "stop_reason": stop_reason,
+                "iterations": int(iterations),
+                "tokens_used": int(tokens_used),
+                "findings_count": len(persisted),
+                "findings_confirmed": sum(
+                    1 for f in persisted if f.verification_status is VerificationStatus.VERIFIED
+                ),
+                "started_at": started_at.isoformat() if started_at else None,
+                "completed_at": completed_at.isoformat(),
+                "duration_s": duration_s,
+                "reports": [self._relative(paths=record.paths, target=p) for p in report_paths],
+            }
+        )
+        manifest.pop("error", None)
+        write_json_atomic(record.paths.root / SESSION_MANIFEST, manifest)
+        await self._finalize_db(
+            record,
+            summary_status,
+            stop_reason,
+            tokens_used=int(tokens_used),
+            completed_at=completed_at,
+        )
+
+    async def fail(self, record: SessionRecord, *, error: str) -> None:
+        """Mark a session as errored; the message is stored in the manifest for the history UI."""
+        completed_at = utcnow()
+        manifest = self._read_manifest(record.paths) or {}
+        started_at = _parse_timestamp(manifest.get("started_at"))
+        duration_s = round((completed_at - started_at).total_seconds(), 2) if started_at else None
+        persisted = self._read_findings_artifact(record.investigation_id)
+        manifest.update(
+            {
+                "investigation_id": record.investigation_id,
+                "session_id": record.session_id,
+                "target": record.target,
+                "mode": record.mode,
+                "engine": record.engine,
+                "provider": record.provider,
+                "model": record.model,
+                "status": ERROR_STATUS,
+                "stop_reason": "error",
+                "error": str(error),
+                "findings_count": len(persisted),
+                "findings_confirmed": sum(
+                    1 for f in persisted.values() if f.verification_status is VerificationStatus.VERIFIED
+                ),
+                "started_at": started_at.isoformat() if started_at else None,
+                "completed_at": completed_at.isoformat(),
+                "duration_s": duration_s,
+                "reports": manifest.get("reports", []),
+            }
+        )
+        write_json_atomic(record.paths.root / SESSION_MANIFEST, manifest)
+        await self._finalize_db(
+            record,
+            ERROR_STATUS,
+            "error",
+            tokens_used=_parse_int(manifest.get("tokens_used")) or 0,
+            completed_at=completed_at,
+        )
+
+    async def _finalize_db(
+        self,
+        record: SessionRecord,
+        summary_status: str,
+        stop_reason: str,
+        *,
+        tokens_used: int,
+        completed_at: datetime,
+    ) -> None:
+        db = await self._ensure_db()
+        if db is None:
+            return
+        try:
+            await InvestigationRepository(db).set_status(
+                record.investigation_id, _DB_INVESTIGATION_STATUS[summary_status], completed_at
+            )
+            await SessionRepository(db).set_status(
+                record.session_id, _DB_SESSION_STATUS[summary_status], completed_at
+            )
+            await db.execute(
+                "UPDATE sessions SET total_tokens_used = ?, ended_at = ?, updated_at = ?"
+                " WHERE session_id = ?",
+                (int(tokens_used), completed_at.isoformat(), completed_at.isoformat(), record.session_id),
+            )
+        except Exception as exc:
+            self._note_db_error(f"finalize({stop_reason})", exc)
+
+    # --- history -------------------------------------------------------------------------------------------
+    async def list_summaries(self, limit: int = 100) -> list[SessionSummary]:
+        """Merge session.json manifests (authoritative) with SQLite history, newest first."""
+        if limit <= 0:
+            return []
+        scanned = self._scan_manifests()
+        merged: dict[str, _ScannedSummary] = {item.summary.investigation_id: item for item in scanned}
+        db_rows = await self._db_summaries()
+        for investigation_id, db_summary in db_rows.items():
+            if investigation_id not in merged:
+                merged[investigation_id] = _ScannedSummary(
+                    db_summary, db_summary.started_at or db_summary.completed_at
+                )
+        for item in scanned:
+            filled = self._with_fallback_timestamps(item.summary, db_rows.get(item.summary.investigation_id))
+            if filled is not item.summary:
+                merged[filled.investigation_id] = _ScannedSummary(
+                    filled, filled.started_at or filled.completed_at or item.sort_ts
+                )
+        known = set(db_rows)
+        for item in scanned:
+            if item.summary.investigation_id not in known:
+                await self._upsert_summary(item.summary)
+        ordered = sorted(
+            merged.values(),
+            key=lambda item: item.sort_ts or datetime.min.replace(tzinfo=UTC),
+            reverse=True,
+        )
+        return [item.summary for item in ordered[:limit]]
+
+    async def get_summary(self, investigation_id: str) -> SessionSummary | None:
+        """Look up a single history entry from disk, falling back to SQLite. Never raises."""
+        try:
+            paths = self._artifacts.paths_for(investigation_id)
+        except StorageError:
+            return None
+        rows = await self._db_summaries([investigation_id])
+        if (paths.root / SESSION_MANIFEST).is_file():
+            item = self._scan_dir(paths.root)
+            if item is not None:
+                return self._with_fallback_timestamps(item.summary, rows.get(investigation_id))
+        return rows.get(investigation_id)
+
+    async def load_findings(self, investigation_id: str) -> list[Finding]:
+        """Return persisted findings, unioning SQLite rows with the evidence artifact. Never raises."""
+        merged: dict[str, Finding] = {}
+        db = await self._ensure_db()
+        if db is not None:
+            try:
+                for finding in await FindingRepository(db).list_for_investigation(investigation_id):
+                    merged[finding.stable_finding_key] = finding
+            except Exception as exc:
+                self._note_db_error("load_findings", exc)
+        for stable_key, finding in self._read_findings_artifact(investigation_id).items():
+            merged.setdefault(stable_key, finding)
+        return sorted(merged.values(), key=lambda f: f.first_detected_at)
+
+    async def delete(self, investigation_id: str) -> None:
+        """Delete an investigation directory and its SQLite rows. Only paths under investigations/."""
+        paths = self._artifacts.paths_for(investigation_id)  # raises StorageError for non-UUID ids
+        base = (self._app_data_dir / "investigations").resolve()
+        root = paths.root.resolve()
+        if root.parent != base:
+            raise StorageError(f"refusing to delete outside the investigations directory: {root}")
+        db = await self._ensure_db()
+        if db is not None:
+            try:
+                await InvestigationRepository(db).delete(investigation_id)
+            except sqlite3.Error as exc:
+                raise StorageError(
+                    f"could not delete investigation {investigation_id} from database: {exc}"
+                ) from exc
+        if root.exists():
+            try:
+                shutil.rmtree(root)
+            except OSError as exc:
+                raise StorageError(f"could not delete investigation directory {root}: {exc}") from exc
+
+    # --- filesystem scan -----------------------------------------------------------------------------------
+    def _scan_manifests(self) -> list[_ScannedSummary]:
+        base = self._app_data_dir / "investigations"
+        if not base.is_dir():
+            return []
+        items: list[_ScannedSummary] = []
+        try:
+            entries = sorted(base.iterdir())
+        except OSError as exc:
+            logger.warning("SessionStore: cannot list %s: %s", base, exc)
+            return []
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            scanned = self._scan_dir(entry)
+            if scanned is not None:
+                items.append(scanned)
+        return items
+
+    def _scan_dir(self, root: Path) -> _ScannedSummary | None:
+        manifest_path = root / SESSION_MANIFEST
+        data = read_json_object(manifest_path)
+        if data is None:
+            return None
+        manifest_id = str(data.get("investigation_id") or "")
+        investigation_id = root.name if _is_uuid(root.name) else (manifest_id or root.name)
+        findings_path = (
+            _resolve_relative(root, data.get("findings_json")) or root / "evidence" / FINDINGS_ARTIFACT
+        )
+        findings_total = _parse_int(data.get("findings_count"))
+        findings_confirmed = _parse_int(data.get("findings_confirmed"))
+        if findings_total is None or findings_confirmed is None:
+            counted_total, counted_confirmed = _count_findings_file(findings_path)
+            findings_total = findings_total if findings_total is not None else counted_total
+            findings_confirmed = findings_confirmed if findings_confirmed is not None else counted_confirmed
+        started_at = _parse_timestamp(data.get("started_at") or data.get("created_at"))
+        completed_at = _parse_timestamp(data.get("completed_at"))
+        duration_s = _parse_float(data.get("duration_s"))
+        if duration_s is None and started_at is not None and completed_at is not None:
+            duration_s = round((completed_at - started_at).total_seconds(), 2)
+        raw_engine = data.get("engine")
+        engine = str(raw_engine).strip() if isinstance(raw_engine, str) and raw_engine.strip() else "legacy"
+        report_md, report_html = _summary_reports(root, data.get("reports"))
+        summary = SessionSummary(
+            investigation_id=investigation_id,
+            session_id=str(data.get("session_id") or ""),
+            target=str(data.get("target") or data.get("primary_target") or root.name),
+            mode=str(data.get("mode") or ""),
+            engine=engine,
+            provider=str(data.get("provider") or ""),
+            model=str(data.get("model") or ""),
+            status=_legacy_status(data),
+            findings_total=max(findings_total, 0),
+            findings_confirmed=max(findings_confirmed, 0),
+            started_at=started_at,
+            completed_at=completed_at,
+            duration_s=duration_s,
+            tokens_used=max(_parse_int(data.get("tokens_used")) or 0, 0),
+            root=root,
+            report_md=report_md,
+            report_html=report_html,
+            findings_json=findings_path if findings_path.is_file() else None,
+        )
+        sort_ts = started_at or completed_at or _mtime(manifest_path)
+        return _ScannedSummary(summary, sort_ts)
+
+    def _read_manifest(self, paths: InvestigationPaths) -> dict[str, Any] | None:
+        return read_json_object(paths.root / SESSION_MANIFEST)
+
+    def _with_fallback_timestamps(
+        self, summary: SessionSummary, db_summary: SessionSummary | None
+    ) -> SessionSummary:
+        """Legacy manifests carry no timestamps: use SQLite created_at, else the folder mtime."""
+        updates: dict[str, Any] = {}
+        if summary.started_at is None:
+            started = db_summary.started_at if db_summary is not None else None
+            if started is None:
+                started = _mtime(summary.root)
+            if started is not None:
+                updates["started_at"] = started
+        if summary.completed_at is None and db_summary is not None and db_summary.completed_at is not None:
+            updates["completed_at"] = db_summary.completed_at
+        return replace(summary, **updates) if updates else summary
+
+    @staticmethod
+    def _relative(*, paths: InvestigationPaths, target: Path) -> str:
+        try:
+            return str(Path(target).resolve().relative_to(paths.root.resolve()))
+        except (ValueError, OSError):
+            return str(target)
+
+    # --- SQLite history ------------------------------------------------------------------------------------
+    async def _db_summaries(self, only: Sequence[str] | None = None) -> dict[str, SessionSummary]:
+        db = await self._ensure_db()
+        if db is None:
+            return {}
+        if only is not None and not only:
+            return {}
+        wanted = set(only) if only is not None else None
+        try:
+            rows = await db.fetchall(
+                "SELECT i.investigation_id, i.primary_target, i.investigation_depth, i.status AS inv_status,"
+                " i.created_at AS inv_created, i.completed_at AS inv_completed,"
+                " s.session_id, s.session_status, s.total_tokens_used, s.created_at AS session_created,"
+                " s.ended_at, p.provider_name AS provider_name, p.model_identifier AS model_identifier"
+                " FROM investigations i LEFT JOIN sessions s ON s.investigation_id = i.investigation_id"
+                " LEFT JOIN provider_model_config p ON p.config_id = s.provider_config_id"
+                " ORDER BY i.created_at DESC, s.created_at DESC"
+            )
+            counts_rows = await db.fetchall(
+                "SELECT investigation_id, COUNT(*) AS total,"
+                " SUM(CASE WHEN verification_status = 'VERIFIED' THEN 1 ELSE 0 END) AS confirmed"
+                " FROM findings GROUP BY investigation_id"
+            )
+        except Exception as exc:
+            self._note_db_error("list_db_summaries", exc)
+            return {}
+        counts = {
+            str(row["investigation_id"]): (_parse_int(row["total"]) or 0, _parse_int(row["confirmed"]) or 0)
+            for row in counts_rows
+        }
+        summaries: dict[str, SessionSummary] = {}
+        for row in rows:
+            investigation_id = str(row["investigation_id"])
+            if wanted is not None and investigation_id not in wanted:
+                continue
+            if investigation_id in summaries:
+                continue
+            started_at = _parse_timestamp(row["session_created"]) or _parse_timestamp(row["inv_created"])
+            completed_at = _parse_timestamp(row["inv_completed"]) or _parse_timestamp(row["ended_at"])
+            duration_s = (
+                round((completed_at - started_at).total_seconds(), 2) if started_at and completed_at else None
+            )
+            summary_status = _db_summary_status(row["inv_status"], row["session_status"])
+            engine, provider, model = _engine_from_provider_config(
+                row["provider_name"], row["model_identifier"]
+            )
+            total, confirmed = counts.get(investigation_id, (0, 0))
+            try:
+                root = self._artifacts.paths_for(investigation_id).root
+            except StorageError:
+                continue
+            report_md = root / "reports" / "report.md"
+            report_html = root / "reports" / "report.html"
+            findings_path = root / "evidence" / FINDINGS_ARTIFACT
+            summaries[investigation_id] = SessionSummary(
+                investigation_id=investigation_id,
+                session_id=str(row["session_id"] or ""),
+                target=str(row["primary_target"] or "unspecified"),
+                mode=str(row["investigation_depth"] or "").lower(),
+                engine=engine,
+                provider=provider,
+                model=model,
+                status=summary_status,
+                findings_total=total,
+                findings_confirmed=confirmed,
+                started_at=started_at,
+                completed_at=completed_at,
+                duration_s=duration_s,
+                tokens_used=max(_parse_int(row["total_tokens_used"]) or 0, 0),
+                root=root,
+                report_md=report_md if report_md.is_file() else None,
+                report_html=report_html if report_html.is_file() else None,
+                findings_json=findings_path if findings_path.is_file() else None,
+            )
+        return summaries
+
+    async def _upsert_summary(self, summary: SessionSummary) -> None:
+        """Best-effort insert of a manifest-only (legacy) session into SQLite."""
+        if not _is_uuid(summary.investigation_id):
+            return
+        db = await self._ensure_db()
+        if db is None:
+            return
+        try:
+            existing = await db.fetchone(
+                "SELECT 1 FROM investigations WHERE investigation_id = ? LIMIT 1",
+                (summary.investigation_id,),
+            )
+            if existing is not None:
+                return
+            terms_id = await self._ensure_terms_acceptance(db)
+            config_id = await self._ensure_provider_config(
+                db, summary.engine, summary.provider, summary.model
+            )
+            created_at = summary.started_at or summary.completed_at or _mtime(summary.root) or utcnow()
+            completed_at = summary.completed_at
+            await InvestigationRepository(db).add(
+                Investigation(
+                    investigation_id=summary.investigation_id,
+                    title=f"Investigation: {summary.target or 'unspecified'}",
+                    description=None,
+                    primary_target=summary.target or "unspecified",
+                    investigation_depth=_depth_for_mode(summary.mode),
+                    status=_DB_INVESTIGATION_STATUS[summary.status],
+                    created_at=created_at,
+                    updated_at=completed_at or created_at,
+                    completed_at=completed_at,
+                    terms_acceptance_id=terms_id,
+                )
+            )
+            session_id = summary.session_id if _is_uuid(summary.session_id) else new_id()
+            await SessionRepository(db).add(
+                Session(
+                    session_id=session_id,
+                    investigation_id=summary.investigation_id,
+                    provider_config_id=config_id,
+                    session_status=_DB_SESSION_STATUS[summary.status],
+                    relative_path=f"investigations/{summary.investigation_id}",
+                    total_tokens_used=summary.tokens_used,
+                    created_at=created_at,
+                    updated_at=completed_at or created_at,
+                    ended_at=completed_at,
+                )
+            )
+        except Exception as exc:
+            self._note_db_error(f"upsert({summary.investigation_id})", exc)
+
+    # --- DB bootstrap rows ---------------------------------------------------------------------------------
+    async def _ensure_terms_acceptance(self, db: Database) -> str:
+        if self._terms_acceptance_id is not None:
+            return self._terms_acceptance_id
+        row = await db.fetchone(
+            "SELECT acceptance_id FROM terms_acceptance WHERE terms_version = ? LIMIT 1", (_TERMS_VERSION,)
+        )
+        if row is not None:
+            self._terms_acceptance_id = str(row["acceptance_id"])
+            return self._terms_acceptance_id
+        accepted_at = utcnow()
+        terms_hash = _sha256(_TERMS_TEXT)
+        acceptance = TermsAcceptance(
+            acceptance_id=new_id(),
+            terms_version=_TERMS_VERSION,
+            terms_hash=terms_hash,
+            accepted_at=accepted_at,
+            acceptance_hash=_sha256(terms_hash + accepted_at.isoformat()),
+        )
+        await TermsAcceptanceRepository(db).add(acceptance)
+        self._terms_acceptance_id = acceptance.acceptance_id
+        return self._terms_acceptance_id
+
+    async def _ensure_provider_config(self, db: Database, engine: str, provider: str, model: str) -> str:
+        provider_name, model_identifier = _provider_identity(engine, provider, model)
+        key = (provider_name, model_identifier)
+        cached = self._provider_config_ids.get(key)
+        if cached is not None:
+            return cached
+        row = await db.fetchone(
+            "SELECT config_id FROM provider_model_config WHERE provider_name = ? AND model_identifier = ?"
+            " AND is_active = 1 LIMIT 1",
+            (provider_name, model_identifier),
+        )
+        if row is not None:
+            config_id = str(row["config_id"])
+            self._provider_config_ids[key] = config_id
+            return config_id
+        config = ProviderModelConfig(
+            config_id=new_id(),
+            provider_name=provider_name,
+            model_identifier=model_identifier,
+            display_name=_provider_display_name(engine, provider_name, model_identifier),
+            base_url=None,
+            keyring_service_key=f"bletiner.{provider_name}.{model_identifier}",
+            context_window_size=_UNVERIFIED_TOKEN_LIMIT,
+            max_output_tokens=_UNVERIFIED_TOKEN_LIMIT,
+            supports_tool_call=False,
+            supports_vision=False,
+            supports_streaming=False,
+            is_active=True,
+            created_at=utcnow(),
+            updated_at=utcnow(),
+        )
+        await ProviderConfigRepository(db).add(config)
+        self._provider_config_ids[key] = config.config_id
+        return config.config_id
+
+
+# --- module helpers -----------------------------------------------------------------------------------------
+def _depth_for_mode(mode: str) -> InvestigationDepth:
+    return InvestigationDepth.DEEP if "deep" in str(mode).lower() else InvestigationDepth.BASIC
+
+
+def _provider_identity(engine: str, provider: str, model: str) -> tuple[str, str]:
+    """The DB requires a provider/model pair even for engines that are not LLM providers."""
+    normalized = str(engine).lower()
+    if normalized == "legacy" and not (provider or model):
+        return ("legacy", "manifest-only")
+    if normalized == "ai" and (provider or model):
+        return (provider or "ai", model or "unverified-model")
+    if provider or model:
+        return (provider or "local", model or "unknown-model")
+    return ("local", "deterministic-recon")
+
+
+def _provider_display_name(engine: str, provider: str, model: str) -> str:
+    if provider == "legacy":
+        return "Legacy session (manifest only)"
+    if str(engine).lower() == "local" and provider == "local":
+        return "Local deterministic recon engine (no LLM)"
+    return f"{provider} / {model}"
+
+
+def _engine_from_provider_config(provider_name: object, model_identifier: object) -> tuple[str, str, str]:
+    """Derive the engine label for DB-only history rows from the linked provider_model_config row."""
+    provider = str(provider_name or "").strip()
+    model = str(model_identifier or "").strip()
+    if provider == "local":
+        return "local", "", ""
+    if provider == "legacy":
+        return "legacy", "", ""
+    if provider:
+        return "ai", provider, model
+    return "unknown", "", ""
+
+
+def _db_summary_status(inv_status_value: object, session_status_value: object) -> str:
+    investigation_status = _coerce_investigation_status(inv_status_value)
+    if investigation_status is InvestigationStatus.COMPLETED:
+        return COMPLETED_STATUS
+    if investigation_status is InvestigationStatus.TERMINATED:
+        return STOPPED_STATUS
+    if investigation_status is InvestigationStatus.FAILED:
+        return ERROR_STATUS
+    session_status = _coerce_session_status(session_status_value)
+    if session_status is None:
+        return LIVE_STATUS
+    return _SESSION_STATUS_TO_SUMMARY[session_status]
+
+
+def _coerce_session_status(value: object) -> SessionStatus | None:
+    try:
+        return SessionStatus(str(value))
+    except ValueError:
+        return None
+
+
+def _coerce_investigation_status(value: object) -> InvestigationStatus | None:
+    try:
+        return InvestigationStatus(str(value))
+    except ValueError:
+        return None
+
+
+def _resolve_relative(root: Path, value: object) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = Path(value.strip())
+    return candidate if candidate.is_absolute() else root / candidate
+
+
+def _summary_reports(root: Path, raw: object) -> tuple[Path | None, Path | None]:
+    report_md: Path | None = None
+    report_html: Path | None = None
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            resolved = _resolve_relative(root, item)
+            if resolved is None:
+                continue
+            suffix = resolved.suffix.lower()
+            if suffix == ".md" and report_md is None:
+                report_md = resolved
+            elif suffix in (".html", ".htm") and report_html is None:
+                report_html = resolved
+    if report_md is None:
+        candidate = root / "reports" / "report.md"
+        report_md = candidate if candidate.is_file() else None
+    if report_html is None:
+        candidate = root / "reports" / "report.html"
+        report_html = candidate if candidate.is_file() else None
+    return report_md, report_html
+
+
+def _count_findings_file(path: Path) -> tuple[int, int]:
+    """Count findings in a findings.json artifact; tolerate corrupt files (0, 0)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return 0, 0
+    if not isinstance(data, list):
+        return 0, 0
+    total = 0
+    confirmed = 0
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        total += 1
+        if str(item.get("verification_status", "")).upper() == VerificationStatus.VERIFIED.value:
+            confirmed += 1
+    return total, confirmed

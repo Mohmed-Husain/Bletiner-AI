@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bletiner"
-version = "0.1.0"
+version = "0.2.1"
 description = "Bletiner AI - autonomous, authorized security investigation workspace (Phases 0-3: sandbox + egress gateway)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Phase 5+ only. Kept optional so Phases 0-3 do not pull a ~500 MB Qt toolchain.
-ui = ["pyside6>=6.7", "qasync>=0.27"]
+ui = ["pyside6>=6.7", "qasync>=0.27", "pyte>=0.8"]
 secrets = ["keyring>=25"]
 dev = [
     "pytest>=8",
@@ -63,8 +63,10 @@ ignore = [
 "bletiner/storage/artifacts.py" = ["S103"]
 "bletiner/container/manager.py" = ["PLC0415"]
 "bletiner/ui/app.py" = ["PLC0415"]
-"bletiner/ui/theme.py" = ["E501"]
-"bletiner/ui/desktop.py" = ["E501", "PLC0415", "RUF001"]
+"bletiner/services/recon.py" = ["E501"]  # long human-readable security descriptions
+"bletiner/__main__.py" = ["PLC0415"]
+"bletiner/ui/**" = ["E501", "PLC0415", "RUF001", "S110", "PLW0603", "BLE001", "ARG001", "ARG002", "PLR0911"]
+"bletiner/providers/http_transport.py" = ["S310"]
 "bletiner/network/proxy.py" = ["S104"]
 "bletiner/network/dns_filter.py" = ["S104"]
 
@@ -77,6 +79,12 @@ packages = ["bletiner"]
 [[tool.mypy.overrides]]
 module = ["docker", "docker.*", "dnslib", "dnslib.*", "keyring", "keyring.*", "PySide6", "PySide6.*", "qasync"]
 ignore_missing_imports = true
+
+# PySide6 runtime shims are dynamically built (Signal/None fallbacks) and the Qt stubs do not model the
+# Qt-style parent/ownership patterns used by the widget layer; strict typing is enforced in the non-UI core.
+[[tool.mypy.overrides]]
+module = ["bletiner.ui.*", "bletiner.providers.http_transport"]
+ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
